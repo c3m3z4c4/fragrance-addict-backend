@@ -5,30 +5,73 @@ const { Pool } = pg;
 
 let pool = null;
 let isDatabaseConnected = false;
+let connectionError = null;
+
+// Validar formato de DATABASE_URL
+const validateDatabaseUrl = (url) => {
+    if (!url) return { valid: false, error: 'DATABASE_URL not set' };
+
+    try {
+        // Verificar formato básico
+        if (
+            !url.startsWith('postgresql://') &&
+            !url.startsWith('postgres://')
+        ) {
+            return {
+                valid: false,
+                error: 'URL must start with postgresql:// or postgres://',
+            };
+        }
+
+        // Intentar parsear la URL
+        const parsed = new URL(url);
+
+        if (!parsed.hostname) {
+            return { valid: false, error: 'Missing hostname in DATABASE_URL' };
+        }
+
+        console.log('📊 Database URL parsed:');
+        console.log('   Host:', parsed.hostname);
+        console.log('   Port:', parsed.port || '5432');
+        console.log('   Database:', parsed.pathname.slice(1));
+        console.log('   User:', parsed.username);
+        console.log('   Password:', parsed.password ? '***' : '(empty)');
+
+        return { valid: true };
+    } catch (error) {
+        return { valid: false, error: `Invalid URL format: ${error.message}` };
+    }
+};
 
 // Crear pool de conexiones
 const createPool = () => {
     console.log('🔧 Creating database pool...');
     console.log('📍 DATABASE_URL exists:', !!process.env.DATABASE_URL);
 
-    if (!process.env.DATABASE_URL) {
-        console.warn('⚠️ DATABASE_URL not set - running in memory mode');
+    const validation = validateDatabaseUrl(process.env.DATABASE_URL);
+    if (!validation.valid) {
+        console.error('❌ DATABASE_URL validation failed:', validation.error);
+        connectionError = validation.error;
         return null;
     }
 
     try {
-        return new Pool({
+        const poolConfig = {
             connectionString: process.env.DATABASE_URL,
-            ssl:
-                process.env.NODE_ENV === 'production'
-                    ? { rejectUnauthorized: false }
-                    : false,
+            ssl: false, // Dokploy internal network doesn't need SSL
             max: 10,
             idleTimeoutMillis: 30000,
-            connectionTimeoutMillis: 5000,
+            connectionTimeoutMillis: 10000,
+        };
+
+        console.log('🔌 Pool config:', {
+            ...poolConfig,
+            connectionString: '***',
         });
+        return new Pool(poolConfig);
     } catch (error) {
         console.error('❌ Error creating pool:', error.message);
+        connectionError = error.message;
         return null;
     }
 };
@@ -43,7 +86,25 @@ export const initDatabase = async () => {
     if (!pool) {
         console.warn('⚠️ No database pool available - using in-memory storage');
         isDatabaseConnected = false;
-        return;
+        return { connected: false, error: connectionError };
+    }
+
+    // Primero probar conexión simple
+    console.log('🔍 Testing database connection...');
+    try {
+        const testResult = await pool.query(
+            'SELECT NOW() as time, current_database() as db'
+        );
+        console.log('✅ Database connection successful!');
+        console.log('   Server time:', testResult.rows[0].time);
+        console.log('   Database:', testResult.rows[0].db);
+    } catch (error) {
+        console.error('❌ Database connection test failed:', error.message);
+        console.error('   Error code:', error.code);
+        connectionError = `Connection test failed: ${error.message}`;
+        isDatabaseConnected = false;
+        pool = null;
+        return { connected: false, error: connectionError };
     }
 
     const createTableQuery = `
@@ -74,15 +135,22 @@ export const initDatabase = async () => {
     try {
         await pool.query(createTableQuery);
         isDatabaseConnected = true;
-        console.log('✅ Database initialized successfully');
+        connectionError = null;
+        console.log('✅ Database tables initialized successfully');
+        return { connected: true, error: null };
     } catch (error) {
-        console.error('❌ Error initializing database:', error.message);
+        console.error('❌ Error creating tables:', error.message);
+        connectionError = `Table creation failed: ${error.message}`;
         isDatabaseConnected = false;
         console.warn(
             '⚠️ Continuing without database - using in-memory storage'
         );
+        return { connected: false, error: connectionError };
     }
 };
+
+// Obtener error de conexión
+export const getConnectionError = () => connectionError;
 
 // In-memory fallback storage
 let memoryStore = [];
