@@ -25,6 +25,18 @@ const isValidUrl = (string) => {
     }
 };
 
+// Estado de la cola de scraping
+let scrapingQueue = {
+    urls: [],
+    processing: false,
+    current: null,
+    processed: 0,
+    failed: 0,
+    total: 0,
+    startedAt: null,
+    errors: [],
+};
+
 // GET /api/scrape/perfume?url=... - Scrapear un perfume
 router.get('/perfume', requireApiKey, scrapeLimiter, async (req, res, next) => {
     try {
@@ -105,6 +117,342 @@ router.post('/batch', requireApiKey, async (req, res, next) => {
         next(new ApiError(error.message, 500));
     }
 });
+
+// POST /api/scrape/sitemap - Obtener URLs del sitemap de Fragrantica
+router.post('/sitemap', requireApiKey, async (req, res, next) => {
+    try {
+        const { brand, limit = 100 } = req.body;
+
+        console.log(
+            `📥 Fetching sitemap for brand: ${brand || 'all'}, limit: ${limit}`
+        );
+
+        const puppeteer = (await import('puppeteer')).default;
+        const browser = await puppeteer.launch({
+            headless: 'new',
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+            ],
+        });
+
+        const page = await browser.newPage();
+        await page.setUserAgent(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        );
+
+        let urls = [];
+
+        if (brand) {
+            // Fragrantica brand URLs formats:
+            // - https://www.fragrantica.com/designers/Dior.html
+            // - https://www.fragrantica.com/designers/Tom-Ford.html
+
+            // Normalize brand name for URL
+            const brandSlug = brand
+                .trim()
+                .replace(/\s+/g, '-') // Replace spaces with hyphens
+                .replace(/['']/g, '') // Remove apostrophes
+                .replace(/&/g, 'and'); // Replace & with 'and'
+
+            const brandUrl = `https://www.fragrantica.com/designers/${brandSlug}.html`;
+            console.log(`Fetching brand page: ${brandUrl}`);
+
+            try {
+                await page.goto(brandUrl, {
+                    waitUntil: 'networkidle2',
+                    timeout: 60000,
+                });
+
+                // Wait for perfume links to load
+                await page
+                    .waitForSelector('a[href*="/perfume/"]', { timeout: 10000 })
+                    .catch(() => {
+                        console.log(
+                            'Waiting for perfume links timed out, continuing...'
+                        );
+                    });
+
+                urls = await page.evaluate(() => {
+                    const links = document.querySelectorAll(
+                        'a[href*="/perfume/"]'
+                    );
+                    return Array.from(links)
+                        .map((link) => link.href)
+                        .filter((href) => {
+                            // Filter only valid perfume detail pages
+                            return (
+                                href.includes('/perfume/') &&
+                                !href.includes('#') &&
+                                !href.includes('?') &&
+                                href.match(/\/perfume\/[^/]+\/[^/]+\.html$/)
+                            );
+                        });
+                });
+
+                // Remove duplicates
+                urls = [...new Set(urls)];
+
+                console.log(
+                    `Found ${urls.length} perfume URLs for brand ${brand}`
+                );
+
+                // If no URLs found, try the search page as fallback
+                if (urls.length === 0) {
+                    console.log(
+                        'No URLs found on brand page, trying search...'
+                    );
+                    const searchUrl = `https://www.fragrantica.com/search/?query=${encodeURIComponent(
+                        brand
+                    )}`;
+                    await page.goto(searchUrl, {
+                        waitUntil: 'networkidle2',
+                        timeout: 60000,
+                    });
+
+                    // Wait a bit for results to load
+                    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+                    urls = await page.evaluate(() => {
+                        const links = document.querySelectorAll(
+                            'a[href*="/perfume/"]'
+                        );
+                        return Array.from(links)
+                            .map((link) => link.href)
+                            .filter(
+                                (href) =>
+                                    href.includes('/perfume/') &&
+                                    href.match(/\.html$/)
+                            );
+                    });
+
+                    urls = [...new Set(urls)];
+                    console.log(`Found ${urls.length} perfume URLs via search`);
+                }
+            } catch (navError) {
+                console.error(`Navigation error: ${navError.message}`);
+                await browser.close();
+                return res.json({
+                    success: false,
+                    error: `Could not load brand page for "${brand}". Make sure the brand name matches exactly as shown on Fragrantica (e.g., "Dior", "Tom Ford", "Chanel").`,
+                    urls: [],
+                    count: 0,
+                });
+            }
+        } else {
+            // Fetch from sitemap
+            try {
+                await page.goto('https://www.fragrantica.com/sitemap.xml', {
+                    waitUntil: 'networkidle2',
+                    timeout: 60000,
+                });
+
+                const sitemapContent = await page.content();
+
+                // Extract perfume sitemap URLs
+                const sitemapMatches =
+                    sitemapContent.match(/sitemap_perfumes_\d+\.xml/g) || [];
+                console.log(`Found ${sitemapMatches.length} perfume sitemaps`);
+
+                if (sitemapMatches.length > 0) {
+                    // Get first sitemap for perfumes
+                    const sitemapUrl = `https://www.fragrantica.com/${sitemapMatches[0]}`;
+                    console.log(`Fetching: ${sitemapUrl}`);
+
+                    await page.goto(sitemapUrl, {
+                        waitUntil: 'networkidle2',
+                        timeout: 60000,
+                    });
+
+                    urls = await page.evaluate(() => {
+                        const locs = document.querySelectorAll('loc');
+                        return Array.from(locs)
+                            .map((loc) => loc.textContent)
+                            .filter((url) => url && url.includes('/perfume/'));
+                    });
+
+                    console.log(`Found ${urls.length} URLs in sitemap`);
+                }
+            } catch (sitemapError) {
+                console.error(`Sitemap error: ${sitemapError.message}`);
+            }
+        }
+
+        await browser.close();
+
+        // Limit results
+        urls = urls.slice(0, parseInt(limit));
+
+        console.log(`Returning ${urls.length} perfume URLs`);
+
+        res.json({
+            success: true,
+            count: urls.length,
+            urls,
+            brand: brand || null,
+        });
+    } catch (error) {
+        console.error('Sitemap error:', error);
+        next(new ApiError(error.message, 500));
+    }
+});
+
+// POST /api/scrape/queue - Add URLs to scraping queue
+router.post('/queue', requireApiKey, async (req, res, next) => {
+    try {
+        const { urls } = req.body;
+
+        if (!urls || !Array.isArray(urls) || urls.length === 0) {
+            return next(new ApiError('Array de URLs requerido', 400));
+        }
+
+        // Filter valid URLs and remove duplicates
+        const validUrls = [...new Set(urls.filter((url) => isValidUrl(url)))];
+
+        // Get existing perfume URLs to avoid duplicates
+        const existing = await dataStore.getAll();
+        const existingUrls = new Set(existing.map((p) => p.sourceUrl));
+
+        const newUrls = validUrls.filter((url) => !existingUrls.has(url));
+
+        scrapingQueue.urls.push(...newUrls);
+        scrapingQueue.total =
+            scrapingQueue.urls.length + scrapingQueue.processed;
+
+        console.log(
+            `📥 Added ${newUrls.length} URLs to queue (${
+                validUrls.length - newUrls.length
+            } duplicates skipped)`
+        );
+
+        res.json({
+            success: true,
+            added: newUrls.length,
+            skipped: validUrls.length - newUrls.length,
+            queueSize: scrapingQueue.urls.length,
+        });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
+// POST /api/scrape/queue/start - Start processing the queue
+router.post('/queue/start', requireApiKey, async (req, res, next) => {
+    try {
+        if (scrapingQueue.processing) {
+            return res.json({
+                success: false,
+                message: 'Queue already processing',
+            });
+        }
+
+        if (scrapingQueue.urls.length === 0) {
+            return res.json({ success: false, message: 'Queue is empty' });
+        }
+
+        scrapingQueue.processing = true;
+        scrapingQueue.startedAt = new Date().toISOString();
+        scrapingQueue.errors = [];
+
+        console.log(
+            `🚀 Starting queue processing: ${scrapingQueue.urls.length} URLs`
+        );
+
+        // Start processing in background
+        processQueue();
+
+        res.json({
+            success: true,
+            message: 'Queue processing started',
+            queueSize: scrapingQueue.urls.length,
+        });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
+// POST /api/scrape/queue/stop - Stop processing the queue
+router.post('/queue/stop', requireApiKey, (req, res) => {
+    scrapingQueue.processing = false;
+    console.log('⏹️ Queue processing stopped');
+
+    res.json({
+        success: true,
+        message: 'Queue processing stopped',
+        processed: scrapingQueue.processed,
+        remaining: scrapingQueue.urls.length,
+    });
+});
+
+// GET /api/scrape/queue/status - Get queue status
+router.get('/queue/status', requireApiKey, (req, res) => {
+    res.json({
+        success: true,
+        processing: scrapingQueue.processing,
+        current: scrapingQueue.current,
+        processed: scrapingQueue.processed,
+        failed: scrapingQueue.failed,
+        remaining: scrapingQueue.urls.length,
+        total: scrapingQueue.total,
+        startedAt: scrapingQueue.startedAt,
+        errors: scrapingQueue.errors.slice(-10), // Last 10 errors
+    });
+});
+
+// DELETE /api/scrape/queue - Clear the queue
+router.delete('/queue', requireApiKey, (req, res) => {
+    scrapingQueue = {
+        urls: [],
+        processing: false,
+        current: null,
+        processed: 0,
+        failed: 0,
+        total: 0,
+        startedAt: null,
+        errors: [],
+    };
+
+    console.log('🗑️ Queue cleared');
+    res.json({ success: true, message: 'Queue cleared' });
+});
+
+// Background queue processor
+async function processQueue() {
+    while (scrapingQueue.processing && scrapingQueue.urls.length > 0) {
+        const url = scrapingQueue.urls.shift();
+        scrapingQueue.current = url;
+
+        try {
+            console.log(`🔄 Processing: ${url}`);
+            const perfume = await scrapePerfume(url);
+
+            if (perfume) {
+                await dataStore.add(perfume);
+                console.log(`✅ Saved: ${perfume.name}`);
+            }
+
+            scrapingQueue.processed++;
+        } catch (error) {
+            console.error(`❌ Failed: ${url} - ${error.message}`);
+            scrapingQueue.failed++;
+            scrapingQueue.errors.push({
+                url,
+                error: error.message,
+                time: new Date().toISOString(),
+            });
+        }
+
+        // Delay between requests (5 seconds to be safe)
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+
+    scrapingQueue.processing = false;
+    scrapingQueue.current = null;
+    console.log(
+        `✅ Queue processing complete. Processed: ${scrapingQueue.processed}, Failed: ${scrapingQueue.failed}`
+    );
+}
 
 // GET /api/scrape/cache/stats - Estadísticas del caché
 router.get('/cache/stats', requireApiKey, (req, res) => {
