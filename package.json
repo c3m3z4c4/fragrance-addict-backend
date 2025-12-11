@@ -1,22 +1,23 @@
 {
-  "name": "perfume-catalog-api",
-  "version": "1.0.0",
-  "description": "API REST para catálogo de perfumes con web scraping",
-  "main": "src/index.js",
-  "type": "module",
-  "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
-  },
-  "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "helmet": "^7.1.0",
-    "express-rate-limit": "^7.1.5",
-    "cheerio": "^1.0.0-rc.12",
-    "axios": "^1.6.2",
-    "node-cache": "^5.1.2",
-    "uuid": "^9.0.1",
-    "dotenv": "^16.3.1"
-  }
+    "name": "perfume-catalog-api",
+    "version": "1.0.0",
+    "description": "API REST para catálogo de perfumes con web scraping",
+    "main": "src/index.js",
+    "type": "module",
+    "scripts": {
+        "start": "node src/index.js",
+        "dev": "node --watch src/index.js"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "cors": "^2.8.5",
+        "helmet": "^7.1.0",
+        "express-rate-limit": "^7.1.5",
+        "cheerio": "^1.0.0-rc.12",
+        "axios": "^1.6.2",
+        "node-cache": "^5.1.2",
+        "uuid": "^9.0.1",
+        "dotenv": "^16.3.1",
+        "pg": "^8.11.3"
+    }
 }
