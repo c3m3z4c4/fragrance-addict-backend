@@ -3,17 +3,49 @@ import { v4 as uuidv4 } from 'uuid';
 
 const { Pool } = pg;
 
-// Conexión a PostgreSQL
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl:
-        process.env.NODE_ENV === 'production'
-            ? { rejectUnauthorized: false }
-            : false,
-});
+let pool = null;
+let isDatabaseConnected = false;
+
+// Crear pool de conexiones
+const createPool = () => {
+    console.log('🔧 Creating database pool...');
+    console.log('📍 DATABASE_URL exists:', !!process.env.DATABASE_URL);
+
+    if (!process.env.DATABASE_URL) {
+        console.warn('⚠️ DATABASE_URL not set - running in memory mode');
+        return null;
+    }
+
+    try {
+        return new Pool({
+            connectionString: process.env.DATABASE_URL,
+            ssl:
+                process.env.NODE_ENV === 'production'
+                    ? { rejectUnauthorized: false }
+                    : false,
+            max: 10,
+            idleTimeoutMillis: 30000,
+            connectionTimeoutMillis: 5000,
+        });
+    } catch (error) {
+        console.error('❌ Error creating pool:', error.message);
+        return null;
+    }
+};
 
 // Inicializar tabla si no existe
 export const initDatabase = async () => {
+    console.log('🚀 Initializing database...');
+    console.log('🌍 NODE_ENV:', process.env.NODE_ENV || 'development');
+
+    pool = createPool();
+
+    if (!pool) {
+        console.warn('⚠️ No database pool available - using in-memory storage');
+        isDatabaseConnected = false;
+        return;
+    }
+
     const createTableQuery = `
     CREATE TABLE IF NOT EXISTS perfumes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -41,12 +73,19 @@ export const initDatabase = async () => {
 
     try {
         await pool.query(createTableQuery);
+        isDatabaseConnected = true;
         console.log('✅ Database initialized successfully');
     } catch (error) {
         console.error('❌ Error initializing database:', error.message);
-        throw error;
+        isDatabaseConnected = false;
+        console.warn(
+            '⚠️ Continuing without database - using in-memory storage'
+        );
     }
 };
+
+// In-memory fallback storage
+let memoryStore = [];
 
 // Convertir snake_case a camelCase
 const toCamelCase = (row) => {
@@ -72,6 +111,9 @@ const toCamelCase = (row) => {
 };
 
 export const dataStore = {
+    // Estado de conexión
+    isConnected: () => isDatabaseConnected,
+
     // Obtener todos los perfumes con paginación
     getAll: async ({
         page = 1,
@@ -81,37 +123,59 @@ export const dataStore = {
         search,
         sortBy = 'createdAt',
     }) => {
+        if (!isDatabaseConnected) {
+            // Fallback a memoria
+            let filtered = [...memoryStore];
+            if (brand)
+                filtered = filtered.filter((p) =>
+                    p.brand?.toLowerCase().includes(brand.toLowerCase())
+                );
+            if (gender) filtered = filtered.filter((p) => p.gender === gender);
+            if (search)
+                filtered = filtered.filter(
+                    (p) =>
+                        p.name?.toLowerCase().includes(search.toLowerCase()) ||
+                        p.brand?.toLowerCase().includes(search.toLowerCase())
+                );
+            const total = filtered.length;
+            const offset = (page - 1) * limit;
+            return {
+                data: filtered.slice(offset, offset + limit),
+                pagination: {
+                    page,
+                    limit,
+                    total,
+                    totalPages: Math.ceil(total / limit),
+                },
+            };
+        }
+
         let query = 'SELECT * FROM perfumes WHERE 1=1';
         const params = [];
         let paramIndex = 1;
 
-        // Filtrar por marca
         if (brand) {
             query += ` AND LOWER(brand) LIKE LOWER($${paramIndex})`;
             params.push(`%${brand}%`);
             paramIndex++;
         }
 
-        // Filtrar por género
         if (gender) {
             query += ` AND gender = $${paramIndex}`;
             params.push(gender);
             paramIndex++;
         }
 
-        // Búsqueda por texto
         if (search) {
             query += ` AND (LOWER(name) LIKE LOWER($${paramIndex}) OR LOWER(brand) LIKE LOWER($${paramIndex}) OR LOWER(description) LIKE LOWER($${paramIndex}))`;
             params.push(`%${search}%`);
             paramIndex++;
         }
 
-        // Contar total
         const countQuery = query.replace('SELECT *', 'SELECT COUNT(*)');
         const countResult = await pool.query(countQuery, params);
         const total = parseInt(countResult.rows[0].count);
 
-        // Ordenar
         const orderMap = {
             name: 'name ASC',
             rating: 'rating DESC NULLS LAST',
@@ -120,7 +184,6 @@ export const dataStore = {
         };
         query += ` ORDER BY ${orderMap[sortBy] || 'created_at DESC'}`;
 
-        // Paginar
         const offset = (page - 1) * limit;
         query += ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
         params.push(limit, offset);
@@ -140,6 +203,9 @@ export const dataStore = {
 
     // Obtener por ID
     getById: async (id) => {
+        if (!isDatabaseConnected) {
+            return memoryStore.find((p) => p.id === id) || null;
+        }
         const result = await pool.query(
             'SELECT * FROM perfumes WHERE id = $1',
             [id]
@@ -149,6 +215,11 @@ export const dataStore = {
 
     // Buscar por marca
     getByBrand: async (brand) => {
+        if (!isDatabaseConnected) {
+            return memoryStore.filter(
+                (p) => p.brand?.toLowerCase() === brand.toLowerCase()
+            );
+        }
         const result = await pool.query(
             'SELECT * FROM perfumes WHERE LOWER(brand) = LOWER($1) ORDER BY name',
             [brand]
@@ -158,6 +229,11 @@ export const dataStore = {
 
     // Obtener todas las marcas
     getBrands: async () => {
+        if (!isDatabaseConnected) {
+            return [
+                ...new Set(memoryStore.map((p) => p.brand).filter(Boolean)),
+            ].sort();
+        }
         const result = await pool.query(
             'SELECT DISTINCT brand FROM perfumes WHERE brand IS NOT NULL ORDER BY brand'
         );
@@ -167,6 +243,19 @@ export const dataStore = {
     // Agregar perfume
     add: async (perfume) => {
         const id = perfume.id || uuidv4();
+        const now = new Date().toISOString();
+
+        if (!isDatabaseConnected) {
+            const newPerfume = {
+                ...perfume,
+                id,
+                createdAt: now,
+                updatedAt: now,
+            };
+            memoryStore.push(newPerfume);
+            return newPerfume;
+        }
+
         const query = `
       INSERT INTO perfumes (id, name, brand, year, perfumer, gender, concentration, notes, accords, description, image_url, rating, source_url, scraped_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
@@ -195,6 +284,17 @@ export const dataStore = {
 
     // Actualizar perfume
     update: async (id, data) => {
+        if (!isDatabaseConnected) {
+            const index = memoryStore.findIndex((p) => p.id === id);
+            if (index === -1) return null;
+            memoryStore[index] = {
+                ...memoryStore[index],
+                ...data,
+                updatedAt: new Date().toISOString(),
+            };
+            return memoryStore[index];
+        }
+
         const fields = [];
         const values = [];
         let paramIndex = 1;
@@ -242,6 +342,12 @@ export const dataStore = {
 
     // Eliminar perfume
     delete: async (id) => {
+        if (!isDatabaseConnected) {
+            const index = memoryStore.findIndex((p) => p.id === id);
+            if (index === -1) return false;
+            memoryStore.splice(index, 1);
+            return true;
+        }
         const result = await pool.query(
             'DELETE FROM perfumes WHERE id = $1 RETURNING id',
             [id]
@@ -251,6 +357,24 @@ export const dataStore = {
 
     // Estadísticas
     getStats: async () => {
+        if (!isDatabaseConnected) {
+            return {
+                totalPerfumes: memoryStore.length,
+                totalBrands: [...new Set(memoryStore.map((p) => p.brand))]
+                    .length,
+                byGender: {
+                    masculine: memoryStore.filter(
+                        (p) => p.gender === 'masculine'
+                    ).length,
+                    feminine: memoryStore.filter((p) => p.gender === 'feminine')
+                        .length,
+                    unisex: memoryStore.filter((p) => p.gender === 'unisex')
+                        .length,
+                },
+                databaseConnected: false,
+            };
+        }
+
         const statsQuery = `
       SELECT 
         COUNT(*) as total_perfumes,
@@ -271,6 +395,7 @@ export const dataStore = {
                 feminine: parseInt(row.feminine),
                 unisex: parseInt(row.unisex),
             },
+            databaseConnected: true,
         };
     },
 };
