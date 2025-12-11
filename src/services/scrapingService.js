@@ -1,4 +1,4 @@
-import axios from 'axios';
+import puppeteer from 'puppeteer';
 import * as cheerio from 'cheerio';
 import { v4 as uuidv4 } from 'uuid';
 import { cacheService } from './cacheService.js';
@@ -8,39 +8,22 @@ const SCRAPE_DELAY = parseInt(process.env.SCRAPE_DELAY_MS) || 3000;
 // Delay entre requests
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// User agents rotativos para evitar bloqueos
-const userAgents = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-];
+// Configuración del navegador
+const getBrowserConfig = () => ({
+    headless: 'new',
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--window-size=1920,1080',
+        '--disable-blink-features=AutomationControlled',
+    ],
+});
 
-// Headers para evitar bloqueos - simula navegador real
-const getHeaders = (referer = 'https://www.google.com/') => {
-    const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
-    return {
-        'User-Agent': ua,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        Connection: 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'cross-site',
-        'Sec-Fetch-User': '?1',
-        'Sec-Ch-Ua':
-            '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"Windows"',
-        Referer: referer,
-        'Cache-Control': 'max-age=0',
-    };
-};
-
-// Scraper optimizado para Fragrantica.com
+// Scraper con Puppeteer para Fragrantica.com
 export const scrapePerfume = async (url) => {
     // Verificar caché
     const cached = cacheService.get(url);
@@ -49,25 +32,41 @@ export const scrapePerfume = async (url) => {
         return cached;
     }
 
-    console.log(`🔍 Scraping: ${url}`);
+    console.log(`🔍 Scraping con Puppeteer: ${url}`);
+
+    let browser = null;
 
     try {
         await delay(SCRAPE_DELAY);
 
-        const response = await axios.get(url, {
-            headers: getHeaders('https://www.google.com/search?q=fragrantica'),
-            timeout: 30000,
-            maxRedirects: 5,
-            validateStatus: (status) => status < 500,
+        browser = await puppeteer.launch(getBrowserConfig());
+        const page = await browser.newPage();
+
+        // Configurar viewport y user agent
+        await page.setViewport({ width: 1920, height: 1080 });
+        await page.setUserAgent(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        );
+
+        // Configurar headers adicionales
+        await page.setExtraHTTPHeaders({
+            'Accept-Language': 'en-US,en;q=0.9',
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         });
 
-        if (response.status === 403 || response.status === 429) {
-            throw new Error(
-                `Acceso bloqueado (${response.status}). Fragrantica tiene protección anti-bot activa.`
-            );
-        }
+        // Navegar a la página
+        console.log('📄 Navegando a:', url);
+        await page.goto(url, {
+            waitUntil: 'networkidle2',
+            timeout: 60000,
+        });
 
-        const $ = cheerio.load(response.data);
+        // Esperar a que cargue el contenido principal
+        await page.waitForSelector('h1', { timeout: 30000 });
+
+        // Obtener el HTML de la página
+        const html = await page.content();
+        const $ = cheerio.load(html);
 
         // Extraer datos usando selectores de Fragrantica
         const perfume = {
@@ -89,6 +88,18 @@ export const scrapePerfume = async (url) => {
             updatedAt: new Date().toISOString(),
         };
 
+        console.log('✅ Datos extraídos:', {
+            name: perfume.name,
+            brand: perfume.brand,
+            year: perfume.year,
+            gender: perfume.gender,
+            notesCount: {
+                top: perfume.notes?.top?.length || 0,
+                heart: perfume.notes?.heart?.length || 0,
+                base: perfume.notes?.base?.length || 0,
+            },
+        });
+
         // Guardar en caché
         cacheService.set(url, perfume, 86400); // 24 horas
 
@@ -96,17 +107,20 @@ export const scrapePerfume = async (url) => {
     } catch (error) {
         console.error(`❌ Error scraping ${url}:`, error.message);
         throw new Error(`Error al scrapear: ${error.message}`);
+    } finally {
+        if (browser) {
+            await browser.close();
+        }
     }
 };
 
 // Extraer nombre del perfume
-// Formato en Fragrantica: "Sauvage Dior for men" -> extraemos solo el nombre
 function extractName($) {
     const h1Text = $('h1[itemprop="name"]').text().trim();
     if (h1Text) {
         // Remover el género (for men, for women) y la marca
         const cleanName = h1Text
-            .replace(/\s+for\s+(men|women)\s*$/i, '')
+            .replace(/\s+for\s+(men|women|women and men)\s*$/i, '')
             .trim();
 
         // La marca está al final, separar nombre de marca
@@ -119,6 +133,14 @@ function extractName($) {
         }
         return cleanName;
     }
+
+    // Fallback: buscar en el título
+    const title = $('title').text().trim();
+    if (title) {
+        const match = title.match(/^([^|]+)/);
+        return match ? match[1].trim() : title;
+    }
+
     return null;
 }
 
@@ -197,13 +219,16 @@ function extractPerfumer($) {
 function extractGender($) {
     const h1Text = $('h1[itemprop="name"]').text().toLowerCase();
 
+    if (h1Text.includes('for women and men')) {
+        return 'unisex';
+    }
     if (h1Text.includes('for women') || h1Text.includes('pour femme')) {
         return 'feminine';
     }
     if (h1Text.includes('for men') || h1Text.includes('pour homme')) {
         return 'masculine';
     }
-    if (h1Text.includes('unisex') || h1Text.includes('for women and men')) {
+    if (h1Text.includes('unisex')) {
         return 'unisex';
     }
 
@@ -229,10 +254,7 @@ function extractConcentration($) {
     const fullText = (h1Text + ' ' + bodyText).toLowerCase();
 
     const concentrations = [
-        {
-            pattern: /\bextrait\b|\bextract\b|\bparfum\b/i,
-            value: 'Extrait de Parfum',
-        },
+        { pattern: /\bextrait\b|\bextract\b/i, value: 'Extrait de Parfum' },
         { pattern: /\beau\s+de\s+parfum\b|\bedp\b/i, value: 'Eau de Parfum' },
         {
             pattern: /\beau\s+de\s+toilette\b|\bedt\b/i,
@@ -260,64 +282,91 @@ function extractNotes($) {
         base: [],
     };
 
-    // Fragrantica estructura las notas en pyramide-class
-    // Las notas están en elementos con data-note o en spans dentro de divs específicos
-
-    // Método 1: Buscar por estructura de acordes/notas
-    const noteContainers = $('[id*="note"], [class*="note"]');
-
-    // Método 2: Buscar enlaces a notas de perfume
-    const topNotesSection = $(
-        'b:contains("Top Notes"), b:contains("Top notes"), h4:contains("Top")'
-    ).parent();
-    const heartNotesSection = $(
-        'b:contains("Middle Notes"), b:contains("Heart Notes"), b:contains("Heart notes"), h4:contains("Heart"), h4:contains("Middle")'
-    ).parent();
-    const baseNotesSection = $(
-        'b:contains("Base Notes"), b:contains("Base notes"), h4:contains("Base")'
-    ).parent();
-
-    // Extraer notas de cada sección
-    const extractNotesFromSection = ($section) => {
+    // Buscar secciones de notas por texto
+    const extractNotesFromSection = (sectionText) => {
         const notesList = [];
-        $section.find('a[href*="/notes/"], span').each((_, el) => {
+        const $section = $(`*:contains("${sectionText}")`)
+            .filter(function () {
+                return $(this).text().trim().startsWith(sectionText);
+            })
+            .first()
+            .parent();
+
+        $section.find('a[href*="/notes/"]').each((_, el) => {
             const text = $(el).text().trim();
-            if (text && text.length < 50 && !text.includes('Notes')) {
+            if (text && text.length < 50) {
                 notesList.push(text);
             }
         });
-        return [...new Set(notesList)]; // Eliminar duplicados
+
+        return [...new Set(notesList)];
     };
 
-    if (topNotesSection.length) {
-        notes.top = extractNotesFromSection(topNotesSection);
-    }
-    if (heartNotesSection.length) {
-        notes.heart = extractNotesFromSection(heartNotesSection);
-    }
-    if (baseNotesSection.length) {
-        notes.base = extractNotesFromSection(baseNotesSection);
+    // Método principal: buscar por estructura de Fragrantica
+    const pyramidContainer = $('.pyramid, #pyramid, [class*="pyramid"]');
+
+    if (pyramidContainer.length) {
+        // Buscar notas dentro de la pirámide
+        pyramidContainer.find('a[href*="/notes/"]').each((_, el) => {
+            const text = $(el).text().trim();
+            const parent = $(el).closest(
+                '[class*="top"], [class*="heart"], [class*="middle"], [class*="base"]'
+            );
+
+            if (text && text.length < 50) {
+                const parentClass = parent.attr('class') || '';
+                if (parentClass.includes('top')) {
+                    notes.top.push(text);
+                } else if (
+                    parentClass.includes('heart') ||
+                    parentClass.includes('middle')
+                ) {
+                    notes.heart.push(text);
+                } else if (parentClass.includes('base')) {
+                    notes.base.push(text);
+                }
+            }
+        });
     }
 
-    // Método alternativo: buscar todos los enlaces de notas y clasificar por posición
+    // Método alternativo: buscar por headers
+    if (notes.top.length === 0) {
+        notes.top =
+            extractNotesFromSection('Top Notes') ||
+            extractNotesFromSection('Top notes');
+    }
+    if (notes.heart.length === 0) {
+        notes.heart =
+            extractNotesFromSection('Heart Notes') ||
+            extractNotesFromSection('Middle Notes');
+    }
+    if (notes.base.length === 0) {
+        notes.base =
+            extractNotesFromSection('Base Notes') ||
+            extractNotesFromSection('Base notes');
+    }
+
+    // Fallback: obtener todas las notas sin clasificar
     if (
         notes.top.length === 0 &&
         notes.heart.length === 0 &&
         notes.base.length === 0
     ) {
-        const allNoteLinks = $('a[href*="/notes/"]');
         const allNotes = [];
-
-        allNoteLinks.each((_, el) => {
+        $('a[href*="/notes/"]').each((_, el) => {
             const text = $(el).text().trim();
-            if (text && text.length < 50) {
+            if (text && text.length < 50 && !text.includes('Notes')) {
                 allNotes.push(text);
             }
         });
 
-        // Si no hay clasificación, poner todo en top
         if (allNotes.length > 0) {
-            notes.top = [...new Set(allNotes)];
+            const uniqueNotes = [...new Set(allNotes)];
+            // Distribuir notas equitativamente si no hay clasificación
+            const third = Math.ceil(uniqueNotes.length / 3);
+            notes.top = uniqueNotes.slice(0, third);
+            notes.heart = uniqueNotes.slice(third, third * 2);
+            notes.base = uniqueNotes.slice(third * 2);
         }
     }
 
@@ -328,10 +377,11 @@ function extractNotes($) {
 function extractAccords($) {
     const accords = [];
 
-    // Fragrantica muestra acordes en divs con clase accord-bar
-    $('.accord-bar').each((_, el) => {
-        const accordName = $(el).text().trim();
-        const style = $(el).attr('style') || '';
+    // Fragrantica muestra acordes en divs con clase accord-bar o similar
+    $('.accord-bar, [class*="accord"]').each((_, el) => {
+        const $el = $(el);
+        const accordName = $el.text().trim();
+        const style = $el.attr('style') || '';
 
         // Extraer porcentaje del width del estilo
         const widthMatch = style.match(/width:\s*([\d.]+)%/);
@@ -339,13 +389,20 @@ function extractAccords($) {
 
         // Extraer color de fondo
         const bgMatch = style.match(
-            /background:\s*rgb\((\d+),\s*(\d+),\s*(\d+)\)/
+            /background(?:-color)?:\s*(?:rgb\((\d+),\s*(\d+),\s*(\d+)\)|#([a-fA-F0-9]{6})|#([a-fA-F0-9]{3}))/
         );
-        const color = bgMatch
-            ? `rgb(${bgMatch[1]}, ${bgMatch[2]}, ${bgMatch[3]})`
-            : null;
+        let color = null;
+        if (bgMatch) {
+            if (bgMatch[1]) {
+                color = `rgb(${bgMatch[1]}, ${bgMatch[2]}, ${bgMatch[3]})`;
+            } else if (bgMatch[4]) {
+                color = `#${bgMatch[4]}`;
+            } else if (bgMatch[5]) {
+                color = `#${bgMatch[5]}`;
+            }
+        }
 
-        if (accordName) {
+        if (accordName && accordName.length < 50 && !accordName.includes('%')) {
             accords.push({
                 name: accordName,
                 percentage: Math.round(percentage),
@@ -365,7 +422,6 @@ function extractDescription($) {
         '.fragrantica-blockquote',
         'div[class*="description"]',
         '.accord-text',
-        'p.description',
     ];
 
     for (const selector of selectors) {
@@ -407,6 +463,7 @@ function extractImage($) {
         'picture source[type="image/webp"]',
         'picture img',
         'img[alt*="perfume"]',
+        'img[src*="perfume"]',
         '.perfume-image img',
     ];
 
