@@ -8,16 +8,37 @@ const SCRAPE_DELAY = parseInt(process.env.SCRAPE_DELAY_MS) || 3000;
 // Delay entre requests
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Headers para evitar bloqueos
-const getHeaders = () => ({
-    'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br',
-    Connection: 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-});
+// User agents rotativos para evitar bloqueos
+const userAgents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+];
+
+// Headers para evitar bloqueos - simula navegador real
+const getHeaders = (referer = 'https://www.google.com/') => {
+    const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
+    return {
+        'User-Agent': ua,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        Connection: 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'cross-site',
+        'Sec-Fetch-User': '?1',
+        'Sec-Ch-Ua':
+            '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        Referer: referer,
+        'Cache-Control': 'max-age=0',
+    };
+};
 
 // Scraper optimizado para Fragrantica.com
 export const scrapePerfume = async (url) => {
@@ -34,9 +55,17 @@ export const scrapePerfume = async (url) => {
         await delay(SCRAPE_DELAY);
 
         const response = await axios.get(url, {
-            headers: getHeaders(),
-            timeout: 15000,
+            headers: getHeaders('https://www.google.com/search?q=fragrantica'),
+            timeout: 30000,
+            maxRedirects: 5,
+            validateStatus: (status) => status < 500,
         });
+
+        if (response.status === 403 || response.status === 429) {
+            throw new Error(
+                `Acceso bloqueado (${response.status}). Fragrantica tiene protección anti-bot activa.`
+            );
+        }
 
         const $ = cheerio.load(response.data);
 
