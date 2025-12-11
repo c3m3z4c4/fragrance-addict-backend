@@ -7,7 +7,11 @@ import dotenv from 'dotenv';
 import perfumeRoutes from './routes/perfumes.js';
 import scraperRoutes from './routes/scraper.js';
 import { errorHandler } from './middleware/errorHandler.js';
-import { initDatabase, dataStore } from './services/dataStore.js';
+import {
+    initDatabase,
+    dataStore,
+    getConnectionError,
+} from './services/dataStore.js';
 
 dotenv.config();
 
@@ -45,14 +49,52 @@ app.use(limiter);
 // Body parser
 app.use(express.json());
 
-// Health check - siempre disponible
-app.get('/health', (req, res) => {
-    res.json({
+// Health check detallado
+app.get('/health', async (req, res) => {
+    const health = {
         status: 'ok',
         timestamp: new Date().toISOString(),
-        databaseConnected: dataStore.isConnected(),
+        uptime: process.uptime(),
         environment: process.env.NODE_ENV || 'development',
-    });
+        database: {
+            configured: !!process.env.DATABASE_URL,
+            connected: dataStore.isConnected(),
+            error: null,
+        },
+        memory: {
+            used:
+                Math.round(process.memoryUsage().heapUsed / 1024 / 1024) +
+                ' MB',
+            total:
+                Math.round(process.memoryUsage().heapTotal / 1024 / 1024) +
+                ' MB',
+        },
+    };
+
+    // Test de conexión a la base de datos si está configurada
+    if (process.env.DATABASE_URL && !dataStore.isConnected()) {
+        health.database.error =
+            getConnectionError() ||
+            'Connection failed - check DATABASE_URL format and network access';
+        health.status = 'degraded';
+    }
+
+    // Intentar obtener estadísticas si está conectado
+    if (dataStore.isConnected()) {
+        try {
+            const stats = await dataStore.getStats();
+            health.database.stats = {
+                perfumes: stats.totalPerfumes,
+                brands: stats.totalBrands,
+            };
+        } catch (error) {
+            health.database.error = error.message;
+            health.status = 'degraded';
+        }
+    }
+
+    const statusCode = health.status === 'ok' ? 200 : 503;
+    res.status(statusCode).json(health);
 });
 
 // Rutas
