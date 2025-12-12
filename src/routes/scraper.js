@@ -468,7 +468,7 @@ router.delete('/queue', requireApiKey, (req, res) => {
 async function processQueue() {
     let consecutiveRateLimits = 0;
     const MAX_RATE_LIMIT_RETRIES = 3;
-    const RATE_LIMIT_PAUSE_MS = 60000; // 1 minute pause on rate limit
+    const RATE_LIMIT_PAUSE_MS = 120000; // 2 minutes pause on rate limit
 
     while (scrapingQueue.processing && scrapingQueue.urls.length > 0) {
         const url = scrapingQueue.urls.shift();
@@ -549,8 +549,8 @@ async function processQueue() {
             });
         }
 
-        // Delay between requests (8 seconds to be safer)
-        await new Promise((resolve) => setTimeout(resolve, 8000));
+        // Delay between requests (15 seconds to be safer against rate limits)
+        await new Promise((resolve) => setTimeout(resolve, 15000));
     }
 
     scrapingQueue.processing = false;
