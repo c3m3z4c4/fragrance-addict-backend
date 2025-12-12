@@ -269,6 +269,17 @@ export const dataStore = {
         };
     },
 
+    // Get all source URLs (for duplicate checking)
+    getAllSourceUrls: async () => {
+        if (!isDatabaseConnected) {
+            return memoryStore.map((p) => p.sourceUrl).filter(Boolean);
+        }
+        const result = await pool.query(
+            'SELECT source_url FROM perfumes WHERE source_url IS NOT NULL'
+        );
+        return result.rows.map((row) => row.source_url);
+    },
+
     // Obtener por ID
     getById: async (id) => {
         if (!isDatabaseConnected) {

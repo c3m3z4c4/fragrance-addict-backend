@@ -311,8 +311,16 @@ router.post('/queue', requireApiKey, async (req, res, next) => {
         const validUrls = [...new Set(urls.filter((url) => isValidUrl(url)))];
 
         // Get existing perfume URLs to avoid duplicates
-        const existing = await dataStore.getAll();
-        const existingUrls = new Set(existing.map((p) => p.sourceUrl));
+        let existingUrls = new Set();
+        try {
+            const existing = await dataStore.getAllSourceUrls();
+            existingUrls = new Set(existing);
+        } catch (error) {
+            console.warn(
+                'Could not fetch existing URLs, proceeding without duplicate check:',
+                error.message
+            );
+        }
 
         const newUrls = validUrls.filter((url) => !existingUrls.has(url));
 
@@ -333,6 +341,7 @@ router.post('/queue', requireApiKey, async (req, res, next) => {
             queueSize: scrapingQueue.urls.length,
         });
     } catch (error) {
+        console.error('Queue error:', error);
         next(new ApiError(error.message, 500));
     }
 });
