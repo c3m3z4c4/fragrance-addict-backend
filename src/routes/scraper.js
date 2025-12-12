@@ -466,6 +466,10 @@ router.delete('/queue', requireApiKey, (req, res) => {
 
 // Background queue processor
 async function processQueue() {
+    let consecutiveRateLimits = 0;
+    const MAX_RATE_LIMIT_RETRIES = 3;
+    const RATE_LIMIT_PAUSE_MS = 60000; // 1 minute pause on rate limit
+
     while (scrapingQueue.processing && scrapingQueue.urls.length > 0) {
         const url = scrapingQueue.urls.shift();
         scrapingQueue.current = url;
@@ -480,18 +484,73 @@ async function processQueue() {
             }
 
             scrapingQueue.processed++;
+            consecutiveRateLimits = 0; // Reset on success
         } catch (error) {
-            console.error(`❌ Failed: ${url} - ${error.message}`);
+            const errorMessage = error.message || '';
+            console.error(`❌ Failed: ${url} - ${errorMessage}`);
+
+            // Check if it's a rate limit error
+            if (
+                errorMessage.includes('RATE_LIMITED') ||
+                errorMessage.includes('Too Many Requests')
+            ) {
+                consecutiveRateLimits++;
+                console.warn(
+                    `⚠️ Rate limit detected (${consecutiveRateLimits}/${MAX_RATE_LIMIT_RETRIES})`
+                );
+
+                // Put the URL back at the front of the queue for retry
+                scrapingQueue.urls.unshift(url);
+
+                if (consecutiveRateLimits >= MAX_RATE_LIMIT_RETRIES) {
+                    console.error(
+                        '🛑 Too many rate limits. Stopping queue to prevent blocking.'
+                    );
+                    scrapingQueue.errors.push({
+                        url,
+                        error: 'Rate limit alcanzado múltiples veces. Cola pausada automáticamente.',
+                        time: new Date().toISOString(),
+                    });
+                    scrapingQueue.processing = false;
+                    break;
+                }
+
+                // Pause for 1 minute before retrying
+                console.log(
+                    `⏸️ Pausando ${
+                        RATE_LIMIT_PAUSE_MS / 1000
+                    } segundos por rate limit...`
+                );
+                await new Promise((resolve) =>
+                    setTimeout(resolve, RATE_LIMIT_PAUSE_MS)
+                );
+                continue;
+            }
+
+            // For invalid data errors, just skip and continue
+            if (errorMessage.includes('INVALID_DATA')) {
+                console.warn(`⏭️ Skipping invalid data: ${url}`);
+                scrapingQueue.failed++;
+                scrapingQueue.errors.push({
+                    url,
+                    error: errorMessage,
+                    time: new Date().toISOString(),
+                });
+                consecutiveRateLimits = 0;
+                continue;
+            }
+
+            // For other errors, log and continue
             scrapingQueue.failed++;
             scrapingQueue.errors.push({
                 url,
-                error: error.message,
+                error: errorMessage,
                 time: new Date().toISOString(),
             });
         }
 
-        // Delay between requests (5 seconds to be safe)
-        await new Promise((resolve) => setTimeout(resolve, 5000));
+        // Delay between requests (8 seconds to be safer)
+        await new Promise((resolve) => setTimeout(resolve, 8000));
     }
 
     scrapingQueue.processing = false;

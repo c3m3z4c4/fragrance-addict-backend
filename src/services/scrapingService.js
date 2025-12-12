@@ -68,6 +68,28 @@ export const scrapePerfume = async (url) => {
         const html = await page.content();
         const $ = cheerio.load(html);
 
+        // Check for rate limiting or error pages
+        const pageTitle = $('title').text().toLowerCase();
+        const h1Text = $('h1').first().text().toLowerCase();
+        const bodyText = $('body').text().toLowerCase().substring(0, 1000);
+
+        // Detect rate limiting or error pages
+        if (
+            pageTitle.includes('too many requests') ||
+            pageTitle.includes('429') ||
+            pageTitle.includes('error') ||
+            pageTitle.includes('blocked') ||
+            h1Text.includes('too many requests') ||
+            h1Text.includes('access denied') ||
+            bodyText.includes('too many requests') ||
+            bodyText.includes('rate limit') ||
+            bodyText.includes('please try again later')
+        ) {
+            throw new Error(
+                'RATE_LIMITED: Fragrantica ha bloqueado temporalmente las peticiones. Intenta más tarde.'
+            );
+        }
+
         // Extraer datos usando selectores de Fragrantica
         const perfume = {
             id: uuidv4(),
@@ -99,6 +121,22 @@ export const scrapePerfume = async (url) => {
                 base: perfume.notes?.base?.length || 0,
             },
         });
+
+        // Validate required fields before saving
+        if (
+            !perfume.name ||
+            perfume.name.toLowerCase().includes('too many requests')
+        ) {
+            throw new Error(
+                'INVALID_DATA: No se pudo extraer el nombre del perfume. La página puede estar bloqueada.'
+            );
+        }
+
+        if (!perfume.brand) {
+            throw new Error(
+                'INVALID_DATA: No se pudo extraer la marca del perfume. La página puede estar incompleta o bloqueada.'
+            );
+        }
 
         // Guardar en caché
         cacheService.set(url, perfume, 86400); // 24 horas
