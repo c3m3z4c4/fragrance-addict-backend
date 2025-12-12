@@ -52,6 +52,9 @@ app.use(limiter);
 // Body parser
 app.use(express.json());
 
+// Import requireApiKey middleware
+import { requireApiKey } from './middleware/auth.js';
+
 // Health check detallado
 app.get('/health', async (req, res) => {
     const health = {
@@ -98,6 +101,11 @@ app.get('/health', async (req, res) => {
 
     const statusCode = health.status === 'ok' ? 200 : 503;
     res.status(statusCode).json(health);
+});
+
+// Endpoint simple para validar API key (sin dependencias complejas)
+app.get('/api/auth/validate', requireApiKey, (req, res) => {
+    res.json({ success: true, message: 'API key is valid' });
 });
 
 // Rutas
