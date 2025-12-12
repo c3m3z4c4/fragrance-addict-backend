@@ -121,6 +121,10 @@ export const initDatabase = async () => {
       description TEXT,
       image_url TEXT,
       rating DECIMAL(3,2),
+      sillage JSONB,
+      longevity JSONB,
+      projection VARCHAR(50),
+      similar_perfumes JSONB DEFAULT '[]',
       source_url TEXT,
       scraped_at TIMESTAMP WITH TIME ZONE,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -130,6 +134,23 @@ export const initDatabase = async () => {
     CREATE INDEX IF NOT EXISTS idx_perfumes_brand ON perfumes(brand);
     CREATE INDEX IF NOT EXISTS idx_perfumes_gender ON perfumes(gender);
     CREATE INDEX IF NOT EXISTS idx_perfumes_name ON perfumes(name);
+    
+    -- Add new columns if they don't exist (for existing tables)
+    DO $$ 
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='perfumes' AND column_name='sillage') THEN
+        ALTER TABLE perfumes ADD COLUMN sillage JSONB;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='perfumes' AND column_name='longevity') THEN
+        ALTER TABLE perfumes ADD COLUMN longevity JSONB;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='perfumes' AND column_name='projection') THEN
+        ALTER TABLE perfumes ADD COLUMN projection VARCHAR(50);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='perfumes' AND column_name='similar_perfumes') THEN
+        ALTER TABLE perfumes ADD COLUMN similar_perfumes JSONB DEFAULT '[]';
+      END IF;
+    END $$;
   `;
 
     try {
@@ -171,6 +192,10 @@ const toCamelCase = (row) => {
         description: row.description,
         imageUrl: row.image_url,
         rating: row.rating ? parseFloat(row.rating) : null,
+        sillage: row.sillage,
+        longevity: row.longevity,
+        projection: row.projection,
+        similarPerfumes: row.similar_perfumes || [],
         sourceUrl: row.source_url,
         scrapedAt: row.scraped_at,
         createdAt: row.created_at,
@@ -336,8 +361,8 @@ export const dataStore = {
         }
 
         const query = `
-      INSERT INTO perfumes (id, name, brand, year, perfumer, gender, concentration, notes, accords, description, image_url, rating, source_url, scraped_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      INSERT INTO perfumes (id, name, brand, year, perfumer, gender, concentration, notes, accords, description, image_url, rating, sillage, longevity, projection, similar_perfumes, source_url, scraped_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
       RETURNING *
     `;
         const values = [
@@ -353,6 +378,10 @@ export const dataStore = {
             perfume.description || null,
             perfume.imageUrl || null,
             perfume.rating || null,
+            JSON.stringify(perfume.sillage || null),
+            JSON.stringify(perfume.longevity || null),
+            perfume.projection || null,
+            JSON.stringify(perfume.similarPerfumes || []),
             perfume.sourceUrl || null,
             perfume.scrapedAt || null,
         ];
@@ -390,15 +419,27 @@ export const dataStore = {
             description: 'description',
             imageUrl: 'image_url',
             rating: 'rating',
+            sillage: 'sillage',
+            longevity: 'longevity',
+            projection: 'projection',
+            similarPerfumes: 'similar_perfumes',
             sourceUrl: 'source_url',
             scrapedAt: 'scraped_at',
         };
+
+        const jsonFields = [
+            'notes',
+            'accords',
+            'sillage',
+            'longevity',
+            'similarPerfumes',
+        ];
 
         for (const [key, column] of Object.entries(fieldMap)) {
             if (data[key] !== undefined) {
                 fields.push(`${column} = $${paramIndex}`);
                 values.push(
-                    key === 'notes' || key === 'accords'
+                    jsonFields.includes(key)
                         ? JSON.stringify(data[key])
                         : data[key]
                 );
@@ -476,5 +517,44 @@ export const dataStore = {
             },
             databaseConnected: true,
         };
+    },
+
+    // Obtener perfumes que necesitan re-scrape (sin datos de sillage/longevity/similarPerfumes)
+    getIncomplete: async ({ limit = 50 }) => {
+        if (!isDatabaseConnected) {
+            return memoryStore
+                .filter(
+                    (p) =>
+                        !p.sillage || !p.longevity || !p.similarPerfumes?.length
+                )
+                .slice(0, limit);
+        }
+
+        const query = `
+      SELECT * FROM perfumes 
+      WHERE (sillage IS NULL OR longevity IS NULL OR similar_perfumes IS NULL OR similar_perfumes = '[]')
+        AND source_url IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT $1
+    `;
+        const result = await pool.query(query, [limit]);
+        return result.rows.map(toCamelCase);
+    },
+
+    // Contar perfumes incompletos
+    countIncomplete: async () => {
+        if (!isDatabaseConnected) {
+            return memoryStore.filter(
+                (p) => !p.sillage || !p.longevity || !p.similarPerfumes?.length
+            ).length;
+        }
+
+        const query = `
+      SELECT COUNT(*) as count FROM perfumes 
+      WHERE (sillage IS NULL OR longevity IS NULL OR similar_perfumes IS NULL OR similar_perfumes = '[]')
+        AND source_url IS NOT NULL
+    `;
+        const result = await pool.query(query);
+        return parseInt(result.rows[0].count);
     },
 };
