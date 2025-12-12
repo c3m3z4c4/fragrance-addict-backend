@@ -22,6 +22,9 @@ console.log('🔌 Port:', process.env.PORT || 3000);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Trust proxy for rate-limit behind reverse proxy (Traefik/Dokploy)
+app.set('trust proxy', 1);
+
 // Middleware de seguridad
 app.use(helmet());
 
