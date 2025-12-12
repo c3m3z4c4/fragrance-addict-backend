@@ -298,6 +298,44 @@ router.post('/sitemap', requireApiKey, async (req, res, next) => {
     }
 });
 
+// POST /api/scrape/queue/check - Check which URLs already exist
+router.post('/queue/check', requireApiKey, async (req, res, next) => {
+    try {
+        const { urls } = req.body;
+
+        if (!urls || !Array.isArray(urls) || urls.length === 0) {
+            return next(new ApiError('Array de URLs requerido', 400));
+        }
+
+        // Filter valid URLs
+        const validUrls = urls.filter((url) => isValidUrl(url));
+
+        // Get existing perfume URLs
+        let existingUrls = [];
+        try {
+            existingUrls = await dataStore.getAllSourceUrls();
+        } catch (error) {
+            console.warn('Could not fetch existing URLs:', error.message);
+        }
+
+        const existingSet = new Set(existingUrls);
+        const existing = validUrls.filter((url) => existingSet.has(url));
+        const newUrls = validUrls.filter((url) => !existingSet.has(url));
+
+        res.json({
+            success: true,
+            total: validUrls.length,
+            existingCount: existing.length,
+            newCount: newUrls.length,
+            existing,
+            newUrls,
+        });
+    } catch (error) {
+        console.error('Check URLs error:', error);
+        next(new ApiError(error.message, 500));
+    }
+});
+
 // POST /api/scrape/queue - Add URLs to scraping queue
 router.post('/queue', requireApiKey, async (req, res, next) => {
     try {
