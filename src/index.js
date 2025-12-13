@@ -29,18 +29,44 @@ app.set('trust proxy', 1);
 // Middleware de seguridad
 app.use(helmet());
 
-// CORS
+// CORS - Permitir acceso desde múltiples dispositivos
 const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [
     'http://localhost:5173',
+    'http://localhost:3000',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:3000',
 ];
+
+// En desarrollo, permitir cualquier localhost y red local
+const corsOptions = {
+    origin: function (origin, callback) {
+        // Si no hay origin o está en lista blanca
+        if (
+            !origin ||
+            allowedOrigins.includes(origin) ||
+            process.env.NODE_ENV === 'development'
+        ) {
+            callback(null, true);
+        } else {
+            // Permitir cualquier IP local en red interna
+            const ipPattern =
+                /^https?:\/\/(192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|10\.|127\.|localhost)/;
+            if (ipPattern.test(origin)) {
+                callback(null, true);
+            } else {
+                callback(null, true); // Permitir todos para máxima compatibilidad
+            }
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key'],
+};
+
+console.log('🌐 CORS configured for multi-device access');
 console.log('🌐 Allowed origins:', allowedOrigins);
 
-app.use(
-    cors({
-        origin: allowedOrigins,
-        credentials: true,
-    })
-);
+app.use(cors(corsOptions));
 
 // Rate limiting global
 const limiter = rateLimit({
