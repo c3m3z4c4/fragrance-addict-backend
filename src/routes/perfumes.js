@@ -49,12 +49,10 @@ router.get('/search', async (req, res, next) => {
         const { q, page = 1, limit = 12 } = req.query;
 
         if (!q) {
-            return res
-                .status(400)
-                .json({
-                    success: false,
-                    error: 'Parámetro de búsqueda requerido',
-                });
+            return res.status(400).json({
+                success: false,
+                error: 'Parámetro de búsqueda requerido',
+            });
         }
 
         const result = await dataStore.getAll({
@@ -76,14 +74,18 @@ router.get('/brand/:brand', (req, res) => {
 });
 
 // GET /api/perfumes/:id - Detalle
-router.get('/:id', (req, res, next) => {
-    const perfume = dataStore.getById(req.params.id);
+router.get('/:id', async (req, res, next) => {
+    try {
+        const perfume = await dataStore.getById(req.params.id);
 
-    if (!perfume) {
-        return next(new ApiError('Perfume no encontrado', 404));
+        if (!perfume) {
+            return next(new ApiError('Perfume no encontrado', 404));
+        }
+
+        res.json({ success: true, data: perfume });
+    } catch (error) {
+        next(error);
     }
-
-    res.json({ success: true, data: perfume });
 });
 
 // POST /api/perfumes - Crear manualmente
