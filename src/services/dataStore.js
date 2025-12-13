@@ -151,6 +151,22 @@ export const initDatabase = async () => {
         ALTER TABLE perfumes ADD COLUMN similar_perfumes JSONB DEFAULT '[]';
       END IF;
     END $$;
+
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      key VARCHAR(255) UNIQUE NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      device_name VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TIMESTAMP,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_by VARCHAR(255),
+      metadata JSONB
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
+    CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(is_active);
+    CREATE INDEX IF NOT EXISTS idx_api_keys_created_by ON api_keys(created_by);
   `;
 
     try {
@@ -556,5 +572,228 @@ export const dataStore = {
     `;
         const result = await pool.query(query);
         return parseInt(result.rows[0].count);
+    },
+
+    // ===== API KEYS METHODS =====
+
+    // Convertir fila de base de datos a camelCase para API keys
+    apiKeyToCamelCase: (row) => {
+        if (!row) return null;
+        return {
+            id: row.id,
+            key: row.key,
+            name: row.name,
+            deviceName: row.device_name,
+            createdAt: row.created_at,
+            lastUsedAt: row.last_used_at,
+            isActive: row.is_active,
+            createdBy: row.created_by,
+            metadata: row.metadata,
+        };
+    },
+
+    // Agregar nueva clave API
+    addApiKey: async (keyData) => {
+        if (!isDatabaseConnected) {
+            console.warn(
+                '⚠️ Database not connected - API key operations not available'
+            );
+            return null;
+        }
+
+        const query = `
+            INSERT INTO api_keys (key, name, device_name, created_by, metadata, is_active)
+            VALUES ($1, $2, $3, $4, $5, TRUE)
+            RETURNING *
+        `;
+
+        const values = [
+            keyData.key,
+            keyData.name,
+            keyData.deviceName || null,
+            keyData.createdBy || null,
+            JSON.stringify(keyData.metadata || {}),
+        ];
+
+        try {
+            const result = await pool.query(query, values);
+            return dataStore.apiKeyToCamelCase(result.rows[0]);
+        } catch (error) {
+            console.error('❌ Error adding API key:', error.message);
+            return null;
+        }
+    },
+
+    // Obtener clave API por su valor
+    getApiKeyByKey: async (key) => {
+        if (!isDatabaseConnected) {
+            console.warn(
+                '⚠️ Database not connected - API key operations not available'
+            );
+            return null;
+        }
+
+        const query = `
+            SELECT * FROM api_keys 
+            WHERE key = $1 AND is_active = TRUE
+            LIMIT 1
+        `;
+
+        try {
+            const result = await pool.query(query, [key]);
+            return result.rows.length > 0
+                ? dataStore.apiKeyToCamelCase(result.rows[0])
+                : null;
+        } catch (error) {
+            console.error('❌ Error getting API key:', error.message);
+            return null;
+        }
+    },
+
+    // Actualizar último uso de clave API
+    updateApiKeyLastUsed: async (keyId) => {
+        if (!isDatabaseConnected) return false;
+
+        const query = `
+            UPDATE api_keys 
+            SET last_used_at = NOW()
+            WHERE id = $1
+            RETURNING *
+        `;
+
+        try {
+            const result = await pool.query(query, [keyId]);
+            return result.rowCount > 0;
+        } catch (error) {
+            console.error(
+                '❌ Error updating API key last used:',
+                error.message
+            );
+            return false;
+        }
+    },
+
+    // Obtener todas las claves API (admin)
+    getAllApiKeys: async () => {
+        if (!isDatabaseConnected) {
+            console.warn(
+                '⚠️ Database not connected - API key operations not available'
+            );
+            return [];
+        }
+
+        const query = `
+            SELECT * FROM api_keys 
+            ORDER BY created_at DESC
+        `;
+
+        try {
+            const result = await pool.query(query);
+            return result.rows.map(dataStore.apiKeyToCamelCase);
+        } catch (error) {
+            console.error('❌ Error getting all API keys:', error.message);
+            return [];
+        }
+    },
+
+    // Obtener claves API de un usuario específico
+    getApiKeysByUser: async (createdBy) => {
+        if (!isDatabaseConnected) {
+            console.warn(
+                '⚠️ Database not connected - API key operations not available'
+            );
+            return [];
+        }
+
+        const query = `
+            SELECT * FROM api_keys 
+            WHERE created_by = $1
+            ORDER BY created_at DESC
+        `;
+
+        try {
+            const result = await pool.query(query, [createdBy]);
+            return result.rows.map(dataStore.apiKeyToCamelCase);
+        } catch (error) {
+            console.error('❌ Error getting user API keys:', error.message);
+            return [];
+        }
+    },
+
+    // Desactivar clave API
+    deactivateApiKey: async (keyId) => {
+        if (!isDatabaseConnected) return false;
+
+        const query = `
+            UPDATE api_keys 
+            SET is_active = FALSE
+            WHERE id = $1
+            RETURNING *
+        `;
+
+        try {
+            const result = await pool.query(query, [keyId]);
+            return result.rowCount > 0;
+        } catch (error) {
+            console.error('❌ Error deactivating API key:', error.message);
+            return false;
+        }
+    },
+
+    // Eliminar clave API
+    deleteApiKey: async (keyId) => {
+        if (!isDatabaseConnected) return false;
+
+        const query = `
+            DELETE FROM api_keys 
+            WHERE id = $1
+        `;
+
+        try {
+            const result = await pool.query(query, [keyId]);
+            return result.rowCount > 0;
+        } catch (error) {
+            console.error('❌ Error deleting API key:', error.message);
+            return false;
+        }
+    },
+
+    // Obtener estadísticas de claves API
+    getApiKeyStats: async () => {
+        if (!isDatabaseConnected) {
+            return {
+                total: 0,
+                active: 0,
+                inactive: 0,
+                databaseConnected: false,
+            };
+        }
+
+        const query = `
+            SELECT 
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE is_active = TRUE) as active,
+                COUNT(*) FILTER (WHERE is_active = FALSE) as inactive
+            FROM api_keys
+        `;
+
+        try {
+            const result = await pool.query(query);
+            const row = result.rows[0];
+            return {
+                total: parseInt(row.total),
+                active: parseInt(row.active),
+                inactive: parseInt(row.inactive),
+                databaseConnected: true,
+            };
+        } catch (error) {
+            console.error('❌ Error getting API key stats:', error.message);
+            return {
+                total: 0,
+                active: 0,
+                inactive: 0,
+                databaseConnected: false,
+            };
+        }
     },
 };

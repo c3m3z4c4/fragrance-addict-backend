@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 
 import perfumeRoutes from './routes/perfumes.js';
 import scraperRoutes from './routes/scraper.js';
+import apiKeyRoutes from './routes/apiKeys.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import {
     initDatabase,
@@ -111,6 +112,7 @@ app.get('/api/auth/validate', requireApiKey, (req, res) => {
 // Rutas
 app.use('/api/perfumes', perfumeRoutes);
 app.use('/api/scrape', scraperRoutes);
+app.use('/api/keys', apiKeyRoutes);
 
 // Error handler
 app.use(errorHandler);
