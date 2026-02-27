@@ -620,20 +620,31 @@ export const dataStore = {
         };
     },
 
-    // Obtener perfumes que necesitan re-scrape (sin datos de sillage/longevity/similarPerfumes)
+    // Obtener perfumes que necesitan re-scrape (sin notas, acordes, sillage o longevity)
     getIncomplete: async ({ limit = 50 }) => {
         if (!isDatabaseConnected) {
             return memoryStore
                 .filter(
                     (p) =>
-                        !p.sillage || !p.longevity || !p.similarPerfumes?.length
+                        !p.sillage || !p.longevity || !p.similarPerfumes?.length ||
+                        !p.accords?.length ||
+                        (!p.notes?.top?.length && !p.notes?.heart?.length && !p.notes?.base?.length)
                 )
                 .slice(0, limit);
         }
 
         const query = `
-      SELECT * FROM perfumes 
-      WHERE (sillage IS NULL OR longevity IS NULL OR similar_perfumes IS NULL OR similar_perfumes = '[]')
+      SELECT * FROM perfumes
+      WHERE (
+        sillage IS NULL
+        OR longevity IS NULL
+        OR similar_perfumes IS NULL OR similar_perfumes = '[]'
+        OR accords IS NULL OR accords = '[]'
+        OR (
+          (notes IS NULL OR notes = '{}')
+          OR (notes->>'top' = '[]' AND notes->>'heart' = '[]' AND notes->>'base' = '[]')
+        )
+      )
         AND source_url IS NOT NULL
       ORDER BY created_at DESC
       LIMIT $1
@@ -646,13 +657,25 @@ export const dataStore = {
     countIncomplete: async () => {
         if (!isDatabaseConnected) {
             return memoryStore.filter(
-                (p) => !p.sillage || !p.longevity || !p.similarPerfumes?.length
+                (p) =>
+                    !p.sillage || !p.longevity || !p.similarPerfumes?.length ||
+                    !p.accords?.length ||
+                    (!p.notes?.top?.length && !p.notes?.heart?.length && !p.notes?.base?.length)
             ).length;
         }
 
         const query = `
-      SELECT COUNT(*) as count FROM perfumes 
-      WHERE (sillage IS NULL OR longevity IS NULL OR similar_perfumes IS NULL OR similar_perfumes = '[]')
+      SELECT COUNT(*) as count FROM perfumes
+      WHERE (
+        sillage IS NULL
+        OR longevity IS NULL
+        OR similar_perfumes IS NULL OR similar_perfumes = '[]'
+        OR accords IS NULL OR accords = '[]'
+        OR (
+          (notes IS NULL OR notes = '{}')
+          OR (notes->>'top' = '[]' AND notes->>'heart' = '[]' AND notes->>'base' = '[]')
+        )
+      )
         AND source_url IS NOT NULL
     `;
         const result = await pool.query(query);

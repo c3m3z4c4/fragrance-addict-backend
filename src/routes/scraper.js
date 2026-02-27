@@ -719,6 +719,99 @@ async function processQueue() {
     );
 }
 
+// GET /api/scrape/incomplete - Perfumes missing notes, accords, or performance data
+router.get('/incomplete', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+        const [perfumes, count] = await Promise.all([
+            dataStore.getIncomplete({ limit }),
+            dataStore.countIncomplete(),
+        ]);
+
+        const mapped = perfumes.map((p) => ({
+            id: p.id,
+            name: p.name,
+            brand: p.brand,
+            sourceUrl: p.sourceUrl,
+            hasSillage: !!p.sillage,
+            hasLongevity: !!p.longevity,
+            hasSimilarPerfumes: !!(p.similarPerfumes?.length),
+            hasNotes: !!(p.notes?.top?.length || p.notes?.heart?.length || p.notes?.base?.length),
+            hasAccords: !!(p.accords?.length),
+        }));
+
+        res.json({ success: true, count, perfumes: mapped });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
+// POST /api/scrape/rescrape - Re-scrape specific perfumes by ID
+router.post('/rescrape', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { ids } = req.body;
+        if (!ids || !Array.isArray(ids) || ids.length === 0) {
+            return next(new ApiError('ids array is required', 400));
+        }
+        if (ids.length > 20) {
+            return next(new ApiError('Maximum 20 IDs per request', 400));
+        }
+
+        const results = [];
+        const errors = [];
+
+        for (const id of ids) {
+            try {
+                const existing = await dataStore.getById(id);
+                if (!existing?.sourceUrl) {
+                    errors.push({ id, error: 'No source URL found' });
+                    continue;
+                }
+
+                const perfume = await scrapePerfume(existing.sourceUrl);
+                if (perfume) {
+                    await dataStore.update(id, perfume);
+                    results.push({ id, name: perfume.name, success: true });
+                }
+            } catch (err) {
+                errors.push({ id, error: err.message });
+            }
+
+            await new Promise((r) => setTimeout(r, 15000));
+        }
+
+        res.json({
+            success: true,
+            processed: results.length,
+            failed: errors.length,
+            results,
+            errors,
+        });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
+// POST /api/scrape/rescrape/queue - Add incomplete perfumes to scraping queue
+router.post('/rescrape/queue', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { limit = 50 } = req.body;
+        const perfumes = await dataStore.getIncomplete({ limit });
+
+        if (perfumes.length === 0) {
+            return res.json({ success: true, added: 0, queueSize: scrapingQueue.urls.length, message: 'No incomplete perfumes found' });
+        }
+
+        const urlsToAdd = perfumes.filter((p) => p.sourceUrl).map((p) => p.sourceUrl);
+        scrapingQueue.urls.push(...urlsToAdd);
+        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+
+        res.json({ success: true, added: urlsToAdd.length, queueSize: scrapingQueue.urls.length });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
 // GET /api/scrape/cache/stats - Estadísticas del caché
 router.get('/cache/stats', requireSuperAdmin, (req, res) => {
     const stats = cacheService.stats();
