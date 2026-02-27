@@ -37,10 +37,14 @@ router.get('/stats', (req, res) => {
     res.json({ success: true, data: stats });
 });
 
-// GET /api/perfumes/brands - Lista de marcas
-router.get('/brands', (req, res) => {
-    const brands = dataStore.getBrands();
-    res.json({ success: true, data: brands });
+// GET /api/perfumes/brands - Lista de marcas con imagen y conteo
+router.get('/brands', async (req, res, next) => {
+    try {
+        const brands = await dataStore.getBrands();
+        res.json({ success: true, data: brands });
+    } catch (error) {
+        next(error);
+    }
 });
 
 // GET /api/perfumes/search - Búsqueda

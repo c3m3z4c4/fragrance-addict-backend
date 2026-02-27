@@ -418,17 +418,31 @@ export const dataStore = {
         return result.rows.map(toCamelCase);
     },
 
-    // Obtener todas las marcas
+    // Obtener todas las marcas con imagen representativa y conteo
     getBrands: async () => {
         if (!isDatabaseConnected) {
-            return [
-                ...new Set(memoryStore.map((p) => p.brand).filter(Boolean)),
-            ].sort();
+            const brandNames = [...new Set(memoryStore.map((p) => p.brand).filter(Boolean))].sort();
+            return brandNames.map((name) => {
+                const brandPerfumes = memoryStore.filter((p) => p.brand === name);
+                const withImage = brandPerfumes.find((p) => p.image_url);
+                return { name, count: brandPerfumes.length, imageUrl: withImage?.image_url || null };
+            });
         }
-        const result = await pool.query(
-            'SELECT DISTINCT brand FROM perfumes WHERE brand IS NOT NULL ORDER BY brand'
-        );
-        return result.rows.map((row) => row.brand);
+        const result = await pool.query(`
+            SELECT
+                brand AS name,
+                COUNT(*) AS count,
+                (SELECT image_url FROM perfumes p2 WHERE p2.brand = p.brand AND p2.image_url IS NOT NULL AND p2.image_url != '' ORDER BY p2.rating DESC NULLS LAST LIMIT 1) AS image_url
+            FROM perfumes p
+            WHERE brand IS NOT NULL
+            GROUP BY brand
+            ORDER BY brand
+        `);
+        return result.rows.map((row) => ({
+            name: row.name,
+            count: parseInt(row.count),
+            imageUrl: row.image_url || null,
+        }));
     },
 
     // Agregar perfume
