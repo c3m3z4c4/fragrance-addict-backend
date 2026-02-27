@@ -118,6 +118,165 @@ router.post('/batch', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
+// ─── Shared helper: fetch all perfume URLs from a Fragrantica brand page ───────
+
+async function fetchBrandUrls(brand, limit = 500) {
+    const puppeteer = (await import('puppeteer')).default;
+    const browser = await puppeteer.launch({
+        headless: 'new',
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+
+    try {
+        const page = await browser.newPage();
+        await page.setUserAgent(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        );
+
+        const brandSlug = brand.trim()
+            .replace(/\s+/g, '-')
+            .replace(/['']/g, '')
+            .replace(/&/g, 'and');
+
+        const brandUrl = `https://www.fragrantica.com/designers/${brandSlug}.html`;
+        console.log(`🔍 Fetching brand page: ${brandUrl}`);
+
+        await page.goto(brandUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+        await page.waitForSelector('a[href*="/perfume/"]', { timeout: 10000 }).catch(() => {});
+
+        let urls = await page.evaluate(() =>
+            Array.from(document.querySelectorAll('a[href*="/perfume/"]'))
+                .map(a => a.href)
+                .filter(h => h.includes('/perfume/') && !h.includes('#') && !h.includes('?') && /\/perfume\/[^/]+\/[^/]+\.html$/.test(h))
+        );
+        urls = [...new Set(urls)].slice(0, limit);
+        console.log(`  Found ${urls.length} URLs for brand "${brand}"`);
+        return { urls, brandUrl };
+    } finally {
+        await browser.close();
+    }
+}
+
+// POST /api/scrape/brand - Scraping automático de una marca completa
+router.post('/brand', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { brand, limit = 500, autoStart = false } = req.body;
+
+        if (!brand || typeof brand !== 'string' || !brand.trim()) {
+            return next(new ApiError('Brand name is required', 400));
+        }
+
+        const { urls, brandUrl } = await fetchBrandUrls(brand.trim(), parseInt(limit));
+
+        if (urls.length === 0) {
+            return res.json({
+                success: false,
+                error: `No perfume URLs found for brand "${brand}". Check the exact name as it appears on Fragrantica.`,
+                brand,
+                queued: 0,
+            });
+        }
+
+        // Filter already-existing URLs
+        const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
+        const newUrls = urls.filter(u => !existingUrls.has(u));
+
+        // Add to queue
+        scrapingQueue.urls.push(...newUrls);
+        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+
+        console.log(`📥 Brand "${brand}": ${newUrls.length} new, ${urls.length - newUrls.length} skipped`);
+
+        // Auto-start if requested and not already running
+        if (autoStart && !scrapingQueue.processing && newUrls.length > 0) {
+            scrapingQueue.processing = true;
+            scrapingQueue.startedAt = new Date().toISOString();
+            scrapingQueue.errors = [];
+            processQueue();
+        }
+
+        res.json({
+            success: true,
+            brand,
+            brandUrl,
+            total: urls.length,
+            queued: newUrls.length,
+            skipped: urls.length - newUrls.length,
+            queueSize: scrapingQueue.urls.length,
+            autoStarted: autoStart && newUrls.length > 0,
+        });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
+// POST /api/scrape/brands - Scraping automático de varias marcas
+router.post('/brands', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { brands, limitPerBrand = 500, autoStart = false } = req.body;
+
+        if (!brands || !Array.isArray(brands) || brands.length === 0) {
+            return next(new ApiError('brands array is required', 400));
+        }
+
+        if (brands.length > 20) {
+            return next(new ApiError('Maximum 20 brands per request', 400));
+        }
+
+        const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
+        const results = [];
+        let totalQueued = 0;
+        let totalSkipped = 0;
+
+        for (const brand of brands) {
+            if (!brand || typeof brand !== 'string' || !brand.trim()) continue;
+            try {
+                const { urls, brandUrl } = await fetchBrandUrls(brand.trim(), parseInt(limitPerBrand));
+                const newUrls = urls.filter(u => !existingUrls.has(u));
+
+                scrapingQueue.urls.push(...newUrls);
+                newUrls.forEach(u => existingUrls.add(u)); // avoid cross-brand dups
+
+                totalQueued += newUrls.length;
+                totalSkipped += urls.length - newUrls.length;
+
+                results.push({
+                    brand: brand.trim(),
+                    brandUrl,
+                    total: urls.length,
+                    queued: newUrls.length,
+                    skipped: urls.length - newUrls.length,
+                });
+
+                console.log(`📥 Brand "${brand}": ${newUrls.length} new queued`);
+            } catch (err) {
+                results.push({ brand: brand.trim(), error: err.message, queued: 0 });
+            }
+        }
+
+        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+
+        if (autoStart && !scrapingQueue.processing && totalQueued > 0) {
+            scrapingQueue.processing = true;
+            scrapingQueue.startedAt = new Date().toISOString();
+            scrapingQueue.errors = [];
+            processQueue();
+        }
+
+        res.json({
+            success: true,
+            brands: results,
+            totalQueued,
+            totalSkipped,
+            queueSize: scrapingQueue.urls.length,
+            autoStarted: autoStart && totalQueued > 0,
+        });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
 // POST /api/scrape/sitemap - Obtener URLs del sitemap de Fragrantica
 router.post('/sitemap', requireSuperAdmin, async (req, res, next) => {
     try {
