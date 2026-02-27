@@ -1,5 +1,7 @@
+import jwt from 'jsonwebtoken';
 import { ApiError } from './errorHandler.js';
 import { apiKeyService } from '../services/apiKeyService.js';
+import { dataStore } from '../services/dataStore.js';
 
 export const requireApiKey = async (req, res, next) => {
     const apiKey = req.headers['x-api-key'];
@@ -48,4 +50,36 @@ export const requireApiKey = async (req, res, next) => {
         console.error('❌ Error validating API key:', error.message);
         return next(new ApiError('Error validating API key', 500));
     }
+};
+
+// ─── JWT-based auth ────────────────────────────────────────────────────────────
+
+export const requireAuth = async (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return next(new ApiError('Authentication required', 401));
+    }
+
+    const token = authHeader.slice(7);
+    try {
+        const payload = jwt.verify(token, process.env.JWT_SECRET);
+        const user = await dataStore.getUserById(payload.sub);
+        if (!user || !user.is_active) {
+            return next(new ApiError('User not found or inactive', 401));
+        }
+        req.user = user;
+        return next();
+    } catch (err) {
+        return next(new ApiError('Invalid or expired token', 401));
+    }
+};
+
+export const requireSuperAdmin = async (req, res, next) => {
+    await requireAuth(req, res, (err) => {
+        if (err) return next(err);
+        if (req.user?.role !== 'SUPERADMIN') {
+            return next(new ApiError('Superadmin access required', 403));
+        }
+        return next();
+    });
 };

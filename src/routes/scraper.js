@@ -3,7 +3,7 @@ import rateLimit from 'express-rate-limit';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
-import { requireApiKey } from '../middleware/auth.js';
+import { requireSuperAdmin } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 
 const router = express.Router();
@@ -38,7 +38,7 @@ let scrapingQueue = {
 };
 
 // GET /api/scrape/perfume?url=... - Scrapear un perfume
-router.get('/perfume', requireApiKey, scrapeLimiter, async (req, res, next) => {
+router.get('/perfume', requireSuperAdmin, scrapeLimiter, async (req, res, next) => {
     try {
         const { url, save } = req.query;
 
@@ -67,7 +67,7 @@ router.get('/perfume', requireApiKey, scrapeLimiter, async (req, res, next) => {
 });
 
 // POST /api/scrape/batch - Scrapear múltiples URLs
-router.post('/batch', requireApiKey, async (req, res, next) => {
+router.post('/batch', requireSuperAdmin, async (req, res, next) => {
     try {
         const { urls, save = false } = req.body;
 
@@ -119,7 +119,7 @@ router.post('/batch', requireApiKey, async (req, res, next) => {
 });
 
 // POST /api/scrape/sitemap - Obtener URLs del sitemap de Fragrantica
-router.post('/sitemap', requireApiKey, async (req, res, next) => {
+router.post('/sitemap', requireSuperAdmin, async (req, res, next) => {
     try {
         const { brand, limit = 100 } = req.body;
 
@@ -299,7 +299,7 @@ router.post('/sitemap', requireApiKey, async (req, res, next) => {
 });
 
 // POST /api/scrape/queue/check - Check which URLs already exist
-router.post('/queue/check', requireApiKey, async (req, res, next) => {
+router.post('/queue/check', requireSuperAdmin, async (req, res, next) => {
     try {
         const { urls } = req.body;
 
@@ -337,7 +337,7 @@ router.post('/queue/check', requireApiKey, async (req, res, next) => {
 });
 
 // POST /api/scrape/queue - Add URLs to scraping queue
-router.post('/queue', requireApiKey, async (req, res, next) => {
+router.post('/queue', requireSuperAdmin, async (req, res, next) => {
     try {
         const { urls } = req.body;
 
@@ -385,7 +385,7 @@ router.post('/queue', requireApiKey, async (req, res, next) => {
 });
 
 // POST /api/scrape/queue/start - Start processing the queue
-router.post('/queue/start', requireApiKey, async (req, res, next) => {
+router.post('/queue/start', requireSuperAdmin, async (req, res, next) => {
     try {
         if (scrapingQueue.processing) {
             return res.json({
@@ -420,7 +420,7 @@ router.post('/queue/start', requireApiKey, async (req, res, next) => {
 });
 
 // POST /api/scrape/queue/stop - Stop processing the queue
-router.post('/queue/stop', requireApiKey, (req, res) => {
+router.post('/queue/stop', requireSuperAdmin, (req, res) => {
     scrapingQueue.processing = false;
     console.log('⏹️ Queue processing stopped');
 
@@ -433,7 +433,7 @@ router.post('/queue/stop', requireApiKey, (req, res) => {
 });
 
 // GET /api/scrape/queue/status - Get queue status
-router.get('/queue/status', requireApiKey, (req, res) => {
+router.get('/queue/status', requireSuperAdmin, (req, res) => {
     res.json({
         success: true,
         processing: scrapingQueue.processing,
@@ -448,7 +448,7 @@ router.get('/queue/status', requireApiKey, (req, res) => {
 });
 
 // DELETE /api/scrape/queue - Clear the queue
-router.delete('/queue', requireApiKey, (req, res) => {
+router.delete('/queue', requireSuperAdmin, (req, res) => {
     scrapingQueue = {
         urls: [],
         processing: false,
@@ -561,13 +561,13 @@ async function processQueue() {
 }
 
 // GET /api/scrape/cache/stats - Estadísticas del caché
-router.get('/cache/stats', requireApiKey, (req, res) => {
+router.get('/cache/stats', requireSuperAdmin, (req, res) => {
     const stats = cacheService.stats();
     res.json({ success: true, data: stats });
 });
 
 // DELETE /api/scrape/cache - Limpiar caché
-router.delete('/cache', requireApiKey, (req, res) => {
+router.delete('/cache', requireSuperAdmin, (req, res) => {
     cacheService.flush();
     res.json({ success: true, message: 'Caché limpiado' });
 });

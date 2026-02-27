@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
+import bcrypt from 'bcryptjs';
 
 const { Pool } = pg;
 
@@ -167,6 +168,37 @@ export const initDatabase = async () => {
     CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
     CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(is_active);
     CREATE INDEX IF NOT EXISTS idx_api_keys_created_by ON api_keys(created_by);
+
+    -- ===== USERS TABLE =====
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email VARCHAR(255) UNIQUE NOT NULL,
+      name VARCHAR(255),
+      avatar_url TEXT,
+      role VARCHAR(50) NOT NULL DEFAULT 'USER',
+      provider VARCHAR(50) NOT NULL DEFAULT 'local',
+      password_hash VARCHAR(255),
+      google_id VARCHAR(255) UNIQUE,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+    CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id);
+    CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+
+    -- ===== FAVORITES TABLE =====
+    CREATE TABLE IF NOT EXISTS favorites (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      perfume_id UUID NOT NULL REFERENCES perfumes(id) ON DELETE CASCADE,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      UNIQUE(user_id, perfume_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_favorites_user_id ON favorites(user_id);
+    CREATE INDEX IF NOT EXISTS idx_favorites_perfume_id ON favorites(perfume_id);
   `;
 
     try {
@@ -174,15 +206,54 @@ export const initDatabase = async () => {
         isDatabaseConnected = true;
         connectionError = null;
         console.log('✅ Database tables initialized successfully');
+
+        // Seed superadmin from environment variables
+        await seedSuperAdmin();
+
         return { connected: true, error: null };
     } catch (error) {
         console.error('❌ Error creating tables:', error.message);
         connectionError = `Table creation failed: ${error.message}`;
         isDatabaseConnected = false;
-        console.warn(
-            '⚠️ Continuing without database - using in-memory storage'
-        );
+        console.warn('⚠️ Continuing without database - using in-memory storage');
         return { connected: false, error: connectionError };
+    }
+};
+
+// Seed the initial superadmin user from env vars
+const seedSuperAdmin = async () => {
+    const adminEmail = process.env.ADMIN_EMAIL;
+    const adminPassword = process.env.ADMIN_PASSWORD;
+
+    if (!adminEmail || !adminPassword) {
+        console.log('ℹ️ ADMIN_EMAIL/ADMIN_PASSWORD not set — skipping superadmin seed');
+        return;
+    }
+
+    try {
+        const existing = await pool.query(
+            'SELECT id FROM users WHERE email = $1',
+            [adminEmail]
+        );
+        if (existing.rows.length > 0) {
+            // Ensure role is SUPERADMIN
+            await pool.query(
+                "UPDATE users SET role = 'SUPERADMIN' WHERE email = $1",
+                [adminEmail]
+            );
+            console.log(`ℹ️ Superadmin already exists: ${adminEmail}`);
+            return;
+        }
+
+        const hash = await bcrypt.hash(adminPassword, 12);
+        await pool.query(
+            `INSERT INTO users (email, name, role, provider, password_hash)
+             VALUES ($1, $2, 'SUPERADMIN', 'local', $3)`,
+            [adminEmail, 'Superadmin', hash]
+        );
+        console.log(`✅ Superadmin seeded: ${adminEmail}`);
+    } catch (err) {
+        console.error('❌ Error seeding superadmin:', err.message);
     }
 };
 
@@ -761,22 +832,15 @@ export const dataStore = {
     // Obtener estadísticas de claves API
     getApiKeyStats: async () => {
         if (!isDatabaseConnected) {
-            return {
-                total: 0,
-                active: 0,
-                inactive: 0,
-                databaseConnected: false,
-            };
+            return { total: 0, active: 0, inactive: 0, databaseConnected: false };
         }
-
         const query = `
-            SELECT 
+            SELECT
                 COUNT(*) as total,
                 COUNT(*) FILTER (WHERE is_active = TRUE) as active,
                 COUNT(*) FILTER (WHERE is_active = FALSE) as inactive
             FROM api_keys
         `;
-
         try {
             const result = await pool.query(query);
             const row = result.rows[0];
@@ -788,12 +852,185 @@ export const dataStore = {
             };
         } catch (error) {
             console.error('❌ Error getting API key stats:', error.message);
-            return {
-                total: 0,
-                active: 0,
-                inactive: 0,
-                databaseConnected: false,
-            };
+            return { total: 0, active: 0, inactive: 0, databaseConnected: false };
+        }
+    },
+
+    // ===== USER METHODS =====
+
+    getUserByEmail: async (email) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                'SELECT * FROM users WHERE email = $1 AND is_active = TRUE LIMIT 1',
+                [email]
+            );
+            return result.rows[0] || null;
+        } catch (err) {
+            console.error('❌ getUserByEmail:', err.message);
+            return null;
+        }
+    },
+
+    getUserById: async (id) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                'SELECT * FROM users WHERE id = $1 AND is_active = TRUE LIMIT 1',
+                [id]
+            );
+            return result.rows[0] || null;
+        } catch (err) {
+            console.error('❌ getUserById:', err.message);
+            return null;
+        }
+    },
+
+    getUserByGoogleId: async (googleId) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                'SELECT * FROM users WHERE google_id = $1 AND is_active = TRUE LIMIT 1',
+                [googleId]
+            );
+            return result.rows[0] || null;
+        } catch (err) {
+            console.error('❌ getUserByGoogleId:', err.message);
+            return null;
+        }
+    },
+
+    createUser: async ({ email, name, avatarUrl, role = 'USER', provider = 'google', passwordHash = null, googleId = null }) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                `INSERT INTO users (email, name, avatar_url, role, provider, password_hash, google_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 RETURNING *`,
+                [email, name, avatarUrl || null, role, provider, passwordHash, googleId]
+            );
+            return result.rows[0];
+        } catch (err) {
+            console.error('❌ createUser:', err.message);
+            return null;
+        }
+    },
+
+    updateUser: async (id, fields) => {
+        if (!isDatabaseConnected) return null;
+        const allowed = ['name', 'avatar_url', 'google_id', 'role', 'is_active'];
+        const setClauses = [];
+        const values = [];
+        let idx = 1;
+        for (const [key, val] of Object.entries(fields)) {
+            if (allowed.includes(key)) {
+                setClauses.push(`${key} = $${idx++}`);
+                values.push(val);
+            }
+        }
+        if (setClauses.length === 0) return null;
+        setClauses.push(`updated_at = NOW()`);
+        values.push(id);
+        try {
+            const result = await pool.query(
+                `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING *`,
+                values
+            );
+            return result.rows[0] || null;
+        } catch (err) {
+            console.error('❌ updateUser:', err.message);
+            return null;
+        }
+    },
+
+    updateUserRole: async (userId, role) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                "UPDATE users SET role = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+                [role, userId]
+            );
+            return result.rows[0] || null;
+        } catch (err) {
+            console.error('❌ updateUserRole:', err.message);
+            return null;
+        }
+    },
+
+    getAllUsers: async () => {
+        if (!isDatabaseConnected) return [];
+        try {
+            const result = await pool.query(
+                'SELECT id, email, name, avatar_url, role, provider, is_active, created_at FROM users ORDER BY created_at DESC'
+            );
+            return result.rows;
+        } catch (err) {
+            console.error('❌ getAllUsers:', err.message);
+            return [];
+        }
+    },
+
+    // ===== FAVORITES METHODS =====
+
+    getUserFavorites: async (userId) => {
+        if (!isDatabaseConnected) return [];
+        try {
+            const result = await pool.query(
+                `SELECT p.*, f.created_at as favorited_at
+                 FROM favorites f
+                 JOIN perfumes p ON f.perfume_id = p.id
+                 WHERE f.user_id = $1
+                 ORDER BY f.created_at DESC`,
+                [userId]
+            );
+            return result.rows.map(toCamelCase);
+        } catch (err) {
+            console.error('❌ getUserFavorites:', err.message);
+            return [];
+        }
+    },
+
+    addFavorite: async (userId, perfumeId) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                `INSERT INTO favorites (user_id, perfume_id)
+                 VALUES ($1, $2)
+                 ON CONFLICT (user_id, perfume_id) DO NOTHING
+                 RETURNING *`,
+                [userId, perfumeId]
+            );
+            return result.rows[0] || null;
+        } catch (err) {
+            console.error('❌ addFavorite:', err.message);
+            return null;
+        }
+    },
+
+    removeFavorite: async (userId, perfumeId) => {
+        if (!isDatabaseConnected) return false;
+        try {
+            const result = await pool.query(
+                'DELETE FROM favorites WHERE user_id = $1 AND perfume_id = $2',
+                [userId, perfumeId]
+            );
+            return result.rowCount > 0;
+        } catch (err) {
+            console.error('❌ removeFavorite:', err.message);
+            return false;
+        }
+    },
+
+    isFavorite: async (userId, perfumeId) => {
+        if (!isDatabaseConnected) return false;
+        try {
+            const result = await pool.query(
+                'SELECT 1 FROM favorites WHERE user_id = $1 AND perfume_id = $2',
+                [userId, perfumeId]
+            );
+            return result.rows.length > 0;
+        } catch (err) {
+            return false;
         }
     },
 };

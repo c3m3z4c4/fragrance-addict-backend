@@ -6,6 +6,8 @@ import dotenv from 'dotenv';
 
 import perfumeRoutes from './routes/perfumes.js';
 import scraperRoutes from './routes/scraper.js';
+import authRoutes from './routes/auth.js';
+import favoritesRoutes from './routes/favorites.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { initDatabase, dataStore, getConnectionError } from './services/dataStore.js';
 import { requireApiKey } from './middleware/auth.js';
@@ -105,6 +107,8 @@ app.get('/metrics', requireApiKey, (req, res) => {
 // Rutas
 app.use('/api/perfumes', perfumeRoutes);
 app.use('/api/scrape', scraperRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/favorites', favoritesRoutes);
 
 // Error handler
 app.use(errorHandler);
