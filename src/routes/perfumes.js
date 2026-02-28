@@ -72,9 +72,13 @@ router.get('/search', async (req, res, next) => {
 });
 
 // GET /api/perfumes/brand/:brand - Por marca
-router.get('/brand/:brand', (req, res) => {
-    const perfumes = dataStore.getByBrand(req.params.brand);
-    res.json({ success: true, data: perfumes });
+router.get('/brand/:brand', async (req, res, next) => {
+    try {
+        const perfumes = await dataStore.getByBrand(req.params.brand);
+        res.json({ success: true, data: perfumes });
+    } catch (error) {
+        next(error);
+    }
 });
 
 // GET /api/perfumes/:id - Detalle

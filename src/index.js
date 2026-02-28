@@ -95,8 +95,8 @@ app.get('/health', async (req, res) => {
     }
   }
 
-  const statusCode = health.status === 'ok' ? 200 : 503;
-  res.status(statusCode).json(health);
+  // Always 200 — admin distinguishes reachable vs unreachable; body.status has detail
+  res.status(200).json(health);
 });
 
 // Métricas del servidor (protegido con API key)

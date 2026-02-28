@@ -693,23 +693,24 @@ async function processQueue() {
                 scrapingQueue.urls.unshift(url);
 
                 if (consecutiveRateLimits >= MAX_RATE_LIMIT_RETRIES) {
-                    console.error(
-                        '🛑 Too many rate limits. Stopping queue to prevent blocking.'
+                    // Auto-resume: wait 5 minutes then keep going instead of stopping
+                    const longPause = 5 * 60 * 1000; // 5 min
+                    console.warn(
+                        `⚠️ ${MAX_RATE_LIMIT_RETRIES} rate limits consecutivos. Pausa larga de ${longPause / 60000} min, luego reanuda automáticamente.`
                     );
                     scrapingQueue.errors.push({
                         url,
-                        error: 'Rate limit alcanzado múltiples veces. Cola pausada automáticamente.',
+                        error: `Rate limit múltiple: pausa de ${longPause / 60000} min y reanuda automáticamente.`,
                         time: new Date().toISOString(),
                     });
-                    scrapingQueue.processing = false;
-                    break;
+                    consecutiveRateLimits = 0; // Reset counter
+                    await new Promise((resolve) => setTimeout(resolve, longPause));
+                    continue; // Resume automatically
                 }
 
-                // Pause for 1 minute before retrying
+                // Short pause before retry
                 console.log(
-                    `⏸️ Pausando ${
-                        RATE_LIMIT_PAUSE_MS / 1000
-                    } segundos por rate limit...`
+                    `⏸️ Pausando ${RATE_LIMIT_PAUSE_MS / 1000}s por rate limit (intento ${consecutiveRateLimits}/${MAX_RATE_LIMIT_RETRIES})...`
                 );
                 await new Promise((resolve) =>
                     setTimeout(resolve, RATE_LIMIT_PAUSE_MS)
@@ -753,7 +754,7 @@ async function processQueue() {
 // GET /api/scrape/incomplete - Perfumes missing notes, accords, or performance data
 router.get('/incomplete', requireSuperAdmin, async (req, res, next) => {
     try {
-        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+        const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
         const [perfumes, count] = await Promise.all([
             dataStore.getIncomplete({ limit }),
             dataStore.countIncomplete(),
@@ -784,8 +785,8 @@ router.post('/rescrape', requireSuperAdmin, async (req, res, next) => {
         if (!ids || !Array.isArray(ids) || ids.length === 0) {
             return next(new ApiError('ids array is required', 400));
         }
-        if (ids.length > 20) {
-            return next(new ApiError('Maximum 20 IDs per request', 400));
+        if (ids.length > 100) {
+            return next(new ApiError('Maximum 100 IDs per request', 400));
         }
 
         const results = [];
@@ -823,10 +824,10 @@ router.post('/rescrape', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
-// POST /api/scrape/rescrape/queue - Add incomplete perfumes to scraping queue
+// POST /api/scrape/rescrape/queue - Add incomplete perfumes to scraping queue (auto-starts)
 router.post('/rescrape/queue', requireSuperAdmin, async (req, res, next) => {
     try {
-        const { limit = 50 } = req.body;
+        const { limit = 500 } = req.body;
         const perfumes = await dataStore.getIncomplete({ limit });
 
         if (perfumes.length === 0) {
@@ -837,7 +838,17 @@ router.post('/rescrape/queue', requireSuperAdmin, async (req, res, next) => {
         scrapingQueue.urls.push(...urlsToAdd);
         scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
 
-        res.json({ success: true, added: urlsToAdd.length, queueSize: scrapingQueue.urls.length });
+        // Auto-start the queue if not already running
+        let autoStarted = false;
+        if (!scrapingQueue.processing && urlsToAdd.length > 0) {
+            scrapingQueue.processing = true;
+            scrapingQueue.startedAt = new Date().toISOString();
+            scrapingQueue.errors = [];
+            processQueue();
+            autoStarted = true;
+        }
+
+        res.json({ success: true, added: urlsToAdd.length, queueSize: scrapingQueue.urls.length, autoStarted });
     } catch (error) {
         next(new ApiError(error.message, 500));
     }
