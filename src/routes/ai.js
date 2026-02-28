@@ -16,6 +16,9 @@ const ALLOWED_MODELS = [
 ];
 const DEFAULT_MODEL = 'gemini-2.5-flash';
 
+/** Maps profile gender to DB gender value */
+const GENDER_MAP = { man: 'masculine', woman: 'feminine', unisex: 'unisex' };
+
 /** Returns true if the user is eligible for Gemini features (Gmail or Google OAuth) */
 function isGmailUser(user) {
     return user.provider === 'google' || (user.email && user.email.toLowerCase().endsWith('@gmail.com'));
@@ -25,17 +28,27 @@ function isGmailUser(user) {
 function buildProfileBlock(profile) {
     if (!profile) return '';
     const parts = [];
-    if (profile.ageRange) parts.push(`Age range: ${profile.ageRange}`);
-    if (profile.gender)   parts.push(`Gender: ${profile.gender}`);
+    if (profile.ageRange)          parts.push(`Age range: ${profile.ageRange}`);
+    if (profile.gender)            parts.push(`Gender preference: ${profile.gender}`);
+    if (profile.intensity)         parts.push(`Preferred intensity: ${profile.intensity}`);
     if (profile.occasions?.length) parts.push(`Preferred occasions: ${profile.occasions.join(', ')}`);
     if (profile.seasons?.length)   parts.push(`Preferred seasons: ${profile.seasons.join(', ')}`);
-    if (profile.intensity) parts.push(`Preferred intensity: ${profile.intensity}`);
-    return parts.length ? `\nUser profile:\n${parts.map(p => `- ${p}`).join('\n')}` : '';
+    return parts.length ? `User profile:\n${parts.map(p => `- ${p}`).join('\n')}` : '';
+}
+
+/** Format a perfume row for the catalog block (compact, token-efficient) */
+function formatCatalogEntry(p) {
+    const accords = (p.accords || []).slice(0, 3).join(', ');
+    const notes = [
+        ...(p.notes?.top || []),
+        ...(p.notes?.heart || []),
+    ].slice(0, 4).join(', ');
+    const extra = accords || notes;
+    return `- ${p.name} by ${p.brand}${p.concentration ? ` [${p.concentration}]` : ''}${p.gender ? ` (${p.gender})` : ''}${extra ? `: ${extra}` : ''}`;
 }
 
 /**
  * GET /api/ai/models
- * Returns the list of supported models.
  */
 router.get('/models', requireAuth, (_req, res) => {
     res.json({ models: ALLOWED_MODELS, default: DEFAULT_MODEL });
@@ -57,7 +70,6 @@ router.post('/recommendations', requireAuth, async (req, res, next) => {
             return next(new ApiError('Gemini recommendations are available for Google/Gmail users only', 403));
         }
 
-        // Validate requested model
         const requestedModel = req.body?.model;
         const model = (requestedModel && ALLOWED_MODELS.includes(requestedModel))
             ? requestedModel
@@ -65,10 +77,32 @@ router.post('/recommendations', requireAuth, async (req, res, next) => {
 
         const profile = req.body?.profile || null;
 
-        // Fetch user's favourites from DB
-        const favorites = await dataStore.getUserFavorites(req.user.id);
+        // Resolve DB gender filter from profile
+        const dbGender = profile?.gender ? GENDER_MAP[profile.gender] : null;
 
-        let favoritesBlock;
+        // ── 1. Fetch catalog perfumes (up to 120, filtered by gender if provided) ──
+        let catalogPerfumes = [];
+        try {
+            const catalogResult = await dataStore.getAll({
+                page: 1,
+                limit: 120,
+                ...(dbGender ? { gender: dbGender } : {}),
+                sortBy: 'rating',
+            });
+            catalogPerfumes = catalogResult?.data || [];
+        } catch {
+            // Non-fatal — continue without catalog context
+        }
+
+        // ── 2. Fetch user's favourites ──
+        const favorites = await dataStore.getUserFavorites(req.user.id);
+        const favoriteIds = new Set((favorites || []).map(p => p.id));
+
+        // Remove favorites from catalog to avoid re-recommending them
+        const catalogFiltered = catalogPerfumes.filter(p => !favoriteIds.has(p.id));
+
+        // ── 3. Build prompt sections ──
+        let favoritesBlock = '';
         if (favorites && favorites.length > 0) {
             const lines = favorites.map((p) => {
                 const notes = [
@@ -77,26 +111,40 @@ router.post('/recommendations', requireAuth, async (req, res, next) => {
                     ...(p.notes?.base || []),
                 ].slice(0, 6).join(', ');
                 const accords = (p.accords || []).slice(0, 4).join(', ');
-                return `- ${p.name} by ${p.brand}${p.concentration ? ` (${p.concentration})` : ''}${notes ? `: notes of ${notes}` : ''}${accords ? `; accords: ${accords}` : ''}`;
+                return `- ${p.name} by ${p.brand}${p.concentration ? ` (${p.concentration})` : ''}${notes ? `: notes ${notes}` : ''}${accords ? `; accords ${accords}` : ''}`;
             });
-            favoritesBlock = `Favourite perfumes:\n${lines.join('\n')}`;
+            favoritesBlock = `User's favourite perfumes (taste reference — do NOT re-recommend these):\n${lines.join('\n')}`;
         } else {
-            favoritesBlock = 'The user has not yet saved any favourite perfumes.';
+            favoritesBlock = 'The user has not saved any favourite perfumes yet.';
+        }
+
+        let catalogBlock = '';
+        if (catalogFiltered.length > 0) {
+            const entries = catalogFiltered.map(formatCatalogEntry).join('\n');
+            catalogBlock = `\nOur perfume catalog (${catalogFiltered.length} fragrances${dbGender ? `, ${dbGender} only` : ''}) — prioritize recommending from this list:\n${entries}`;
         }
 
         const profileBlock = buildProfileBlock(profile);
 
-        const prompt = `You are an expert perfume sommelier. Based on the user information below, suggest exactly 5 perfumes they would love that are NOT already in their favourites list. Tailor each recommendation to their profile and taste. For each suggestion provide: name, brand, a one-sentence reason why it suits this specific user, and 2-3 key accords/notes. Respond in JSON with this shape: {"recommendations":[{"name":"...","brand":"...","reason":"...","keyNotes":["...","..."]}]}. Do not include markdown fences, only raw JSON.
+        const prompt = `You are an expert perfume sommelier for a fragrance catalog app. Your task is to recommend exactly 5 perfumes the user would love.
+
+INSTRUCTIONS:
+- Prioritize perfumes from the catalog list provided below
+- Do NOT recommend any perfume already in the user's favourites list
+- Tailor recommendations to the user profile (age, gender, occasions, seasons, intensity)
+- For each suggestion: name, brand, one-sentence reason tailored to this specific user, and 2-3 key notes/accords
+- Respond ONLY with raw JSON, no markdown fences: {"recommendations":[{"name":"...","brand":"...","reason":"...","keyNotes":["...","..."]}]}
 
 ${favoritesBlock}
-${profileBlock}`;
+${profileBlock ? `\n${profileBlock}` : ''}
+${catalogBlock}`;
 
         const geminiRes = await fetch(`${GEMINI_BASE}/${model}:generateContent?key=${apiKey}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.85, maxOutputTokens: 1200 },
+                generationConfig: { temperature: 0.85, maxOutputTokens: 1400 },
             }),
         });
 
@@ -125,6 +173,7 @@ ${profileBlock}`;
             success: true,
             recommendations,
             basedOnFavorites: favorites?.length || 0,
+            catalogSize: catalogFiltered.length,
             model,
         });
     } catch (err) {
