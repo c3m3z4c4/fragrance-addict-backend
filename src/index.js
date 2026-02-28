@@ -10,7 +10,7 @@ import authRoutes from './routes/auth.js';
 import favoritesRoutes from './routes/favorites.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { initDatabase, dataStore, getConnectionError } from './services/dataStore.js';
-import { requireApiKey } from './middleware/auth.js';
+import { requireSuperAdmin } from './middleware/auth.js';
 import { metricsMiddleware, getMetrics } from './services/metricsService.js';
 
 dotenv.config();
@@ -99,8 +99,8 @@ app.get('/health', async (req, res) => {
   res.status(200).json(health);
 });
 
-// Métricas del servidor (protegido con API key)
-app.get('/metrics', requireApiKey, (req, res) => {
+// Métricas del servidor (protegido con JWT superadmin)
+app.get('/metrics', requireSuperAdmin, (req, res) => {
   res.json(getMetrics());
 });
 

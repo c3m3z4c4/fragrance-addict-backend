@@ -32,9 +32,13 @@ router.get('/', async (req, res, next) => {
 });
 
 // GET /api/perfumes/stats - Estadísticas
-router.get('/stats', (req, res) => {
-    const stats = dataStore.getStats();
-    res.json({ success: true, data: stats });
+router.get('/stats', async (req, res, next) => {
+    try {
+        const stats = await dataStore.getStats();
+        res.json({ success: true, data: stats });
+    } catch (error) {
+        next(error);
+    }
 });
 
 // GET /api/perfumes/brands - Lista de marcas con imagen y conteo
