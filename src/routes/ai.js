@@ -5,7 +5,7 @@ import { ApiError } from '../middleware/errorHandler.js';
 
 const router = Router();
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
 
 /** Returns true if the user is eligible for Gemini features (Gmail or Google OAuth) */
 function isGmailUser(user) {
