@@ -104,6 +104,8 @@ export const scrapePerfume = async (url) => {
             description: extractDescription($),
             imageUrl: extractImage($),
             rating: extractRating($),
+            longevity: extractPerformanceMetric($, 'longevity'),
+            sillage: extractPerformanceMetric($, 'sillage'),
             seasonUsage: extractSeasonUsage($),
             sourceUrl: url,
             scrapedAt: new Date().toISOString(),
@@ -234,7 +236,7 @@ function extractPerfumer($) {
     if (perfumerLink.length) {
         const perfumers = [];
         perfumerLink.each((_, el) => {
-            const name = $(el).text().trim();
+            const name = $(el).text().trim().replace(/^perfumers?[,:]?\s*/i, '');
             if (name && !perfumers.includes(name)) {
                 perfumers.push(name);
             }
@@ -568,6 +570,113 @@ function extractImage($) {
     }
 
     return null;
+}
+
+// ─── Extraer métricas de rendimiento (longevity / sillage) ───────────────────
+// Fragrantica muestra secciones con vote-buttons para cada nivel.
+// Mapas de etiquetas (EN + ES) → clave interna normalizada.
+const LONGEVITY_LABELS = {
+    // English
+    'poor': 'poor', 'very weak': 'veryweak', 'weak': 'weak',
+    'moderate': 'moderate', 'long lasting': 'longlasting',
+    'very long lasting': 'verylong', 'very long': 'verylong', 'eternal': 'eternal',
+    // Spanish (Fragrantica ES)
+    'escasa': 'poor', 'muy débil': 'veryweak', 'muy debil': 'veryweak',
+    'débil': 'weak', 'debil': 'weak',
+    'moderada': 'moderate', 'duradera': 'longlasting',
+    'muy duradera': 'verylong', 'eterna': 'eternal',
+};
+const SILLAGE_LABELS = {
+    // English
+    'intimate': 'intimate', 'moderate': 'moderate',
+    'strong': 'strong', 'enormous': 'enormous',
+    // Spanish
+    'suave': 'intimate', 'moderada': 'moderate',
+    'fuerte': 'strong', 'pesada': 'strong', 'enorme': 'enormous',
+};
+
+function extractPerformanceMetric($, metric) {
+    const labelMap = metric === 'longevity' ? LONGEVITY_LABELS : SILLAGE_LABELS;
+    const keywords = metric === 'longevity'
+        ? ['longevity', 'longevidad', 'lasting', 'durance']
+        : ['sillage', 'estela', 'trail', 'projection', 'proyección'];
+
+    const votes = {};
+
+    // ── Strategy 1: Fragrantica vote-button structure ─────────────────────
+    // <div class="cell ... longevity ..."> or heading containing keyword
+    // then children with .vote-button-legend + counts
+    const tryVoteButtons = (container) => {
+        container.find('[class*="vote-button"], .vote_chart_graph, .vote-button-wrap').each((_, el) => {
+            const $el = $(el);
+            // Try to find a label (name) and a count in this element or its children
+            const labelEl = $el.find('[class*="name"], [class*="legend"], [class*="label"]').first();
+            const countEl = $el.find('[class*="count"], [class*="num"], [class*="votes"]').first();
+            const labelTxt = (labelEl.length ? labelEl.text() : $el.clone().children().remove().end().text()).trim().toLowerCase();
+            const countTxt = (countEl.length ? countEl.text() : '').trim().replace(/,/g, '');
+            const key = labelMap[labelTxt];
+            const count = parseInt(countTxt, 10);
+            if (key && !isNaN(count) && count >= 0) {
+                votes[key] = (votes[key] || 0) + count;
+            }
+        });
+    };
+
+    // Find the container section that matches this metric
+    $('[class*="cell"], [class*="col"], section, div').each((_, el) => {
+        const $el = $(el);
+        const text = $el.clone().children().remove().end().text().trim().toLowerCase();
+        const cls = ($el.attr('class') || '').toLowerCase();
+        if (keywords.some(kw => text.includes(kw) || cls.includes(kw))) {
+            tryVoteButtons($el);
+        }
+    });
+
+    // ── Strategy 2: Look for any heading with the keyword, then nearby vote buttons ─
+    if (Object.keys(votes).length === 0) {
+        $('b, strong, h3, h4, p').each((_, el) => {
+            const $el = $(el);
+            const txt = $el.text().trim().toLowerCase();
+            if (keywords.some(kw => txt === kw || txt.startsWith(kw))) {
+                // Check parent and siblings
+                tryVoteButtons($el.parent());
+                tryVoteButtons($el.parent().parent());
+            }
+        });
+    }
+
+    // ── Strategy 3: Scan all labels across page that match this metric ────
+    if (Object.keys(votes).length === 0) {
+        $('[class*="vote"], [class*="chart"]').each((_, el) => {
+            const $el = $(el);
+            const allText = $el.text().toLowerCase();
+            const hasKeyword = keywords.some(kw => allText.includes(kw));
+            const hasLabel = Object.keys(labelMap).some(lbl => allText.includes(lbl));
+            if (hasKeyword || hasLabel) {
+                // Try to parse label|count pairs from text
+                Object.keys(labelMap).forEach(lbl => {
+                    const regex = new RegExp(`${lbl}[^\\d]*(\\d[\\d,]*)`, 'i');
+                    const m = allText.match(regex);
+                    if (m) {
+                        const key = labelMap[lbl];
+                        const count = parseInt(m[1].replace(/,/g, ''), 10);
+                        if (!isNaN(count)) votes[key] = Math.max(votes[key] || 0, count);
+                    }
+                });
+            }
+        });
+    }
+
+    if (Object.keys(votes).length === 0) return null;
+
+    // Find dominant (most voted)
+    const sortedEntries = Object.entries(votes).sort((a, b) => b[1] - a[1]);
+    const dominant = sortedEntries[0][0];
+    const maxVotes = sortedEntries[0][1];
+    const totalVotes = Object.values(votes).reduce((s, v) => s + v, 0);
+    const percentage = totalVotes > 0 ? Math.round((maxVotes / totalVotes) * 100) : 0;
+
+    return { dominant, percentage, votes };
 }
 
 // Extraer rating

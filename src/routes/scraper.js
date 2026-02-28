@@ -751,6 +751,85 @@ async function processQueue() {
     );
 }
 
+// GET /api/scrape/incomplete/by-brand - Incomplete perfumes grouped by brand
+router.get('/incomplete/by-brand', requireSuperAdmin, async (req, res, next) => {
+    try {
+        // Fetch up to 5000 to cover most catalogues
+        const perfumes = await dataStore.getIncomplete({ limit: 5000 });
+
+        const brandMap = {};
+        for (const p of perfumes) {
+            if (!p.brand) continue;
+            if (!brandMap[p.brand]) {
+                brandMap[p.brand] = { brand: p.brand, count: 0, ids: [], urls: [] };
+            }
+            brandMap[p.brand].count++;
+            brandMap[p.brand].ids.push(p.id);
+            if (p.sourceUrl) brandMap[p.brand].urls.push(p.sourceUrl);
+        }
+
+        const brands = Object.values(brandMap).sort((a, b) => b.count - a.count);
+        res.json({ success: true, brands, total: perfumes.length });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
+// POST /api/scrape/rescrape/brand - Queue or directly re-scrape all incomplete from a brand
+router.post('/rescrape/brand', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { brand, direct = false } = req.body;
+        if (!brand) return next(new ApiError('brand is required', 400));
+
+        const perfumes = await dataStore.getIncomplete({ limit: 5000 });
+        const brandPerfumes = perfumes.filter(p => p.brand === brand && p.sourceUrl);
+
+        if (brandPerfumes.length === 0) {
+            return res.json({ success: true, added: 0, message: 'No incomplete perfumes for this brand' });
+        }
+
+        if (direct) {
+            // Direct re-scrape (synchronous, max 100)
+            if (brandPerfumes.length > 100) {
+                return next(new ApiError('Too many perfumes for direct mode — use queue instead', 400));
+            }
+            const results = [];
+            const errors = [];
+            for (const p of brandPerfumes) {
+                try {
+                    const scraped = await scrapePerfume(p.sourceUrl);
+                    if (scraped) {
+                        await dataStore.update(p.id, scraped);
+                        results.push({ id: p.id, name: p.name, success: true });
+                    }
+                } catch (err) {
+                    errors.push({ id: p.id, error: err.message });
+                }
+                await new Promise(r => setTimeout(r, 15000));
+            }
+            return res.json({ success: true, processed: results.length, failed: errors.length, results, errors });
+        }
+
+        // Queue mode
+        const urls = brandPerfumes.map(p => p.sourceUrl);
+        scrapingQueue.urls.push(...urls);
+        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+
+        let autoStarted = false;
+        if (!scrapingQueue.processing) {
+            scrapingQueue.processing = true;
+            scrapingQueue.startedAt = new Date().toISOString();
+            scrapingQueue.errors = [];
+            processQueue();
+            autoStarted = true;
+        }
+
+        res.json({ success: true, added: urls.length, queueSize: scrapingQueue.urls.length, autoStarted });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
 // GET /api/scrape/incomplete - Perfumes missing notes, accords, or performance data
 router.get('/incomplete', requireSuperAdmin, async (req, res, next) => {
     try {

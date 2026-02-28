@@ -215,6 +215,13 @@ export const initDatabase = async () => {
     );
 
     CREATE INDEX IF NOT EXISTS idx_brands_name ON brands(name);
+
+    -- ===== SITE CONTENT TABLE (editable page content managed by superadmin) =====
+    CREATE TABLE IF NOT EXISTS site_content (
+      key VARCHAR(255) PRIMARY KEY,
+      value JSONB NOT NULL DEFAULT '{}',
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
   `;
 
     try {
@@ -1090,6 +1097,38 @@ export const dataStore = {
             );
             return result.rows.length > 0;
         } catch (err) {
+            return false;
+        }
+    },
+
+    // ===== SITE CONTENT METHODS =====
+
+    getContent: async (key) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                'SELECT value FROM site_content WHERE key = $1',
+                [key]
+            );
+            return result.rows[0]?.value ?? null;
+        } catch (err) {
+            console.error('❌ getContent:', err.message);
+            return null;
+        }
+    },
+
+    setContent: async (key, value) => {
+        if (!isDatabaseConnected) return false;
+        try {
+            await pool.query(
+                `INSERT INTO site_content (key, value, updated_at)
+                 VALUES ($1, $2, NOW())
+                 ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+                [key, JSON.stringify(value)]
+            );
+            return true;
+        } catch (err) {
+            console.error('❌ setContent:', err.message);
             return false;
         }
     },

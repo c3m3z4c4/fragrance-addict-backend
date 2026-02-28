@@ -8,6 +8,8 @@ import perfumeRoutes from './routes/perfumes.js';
 import scraperRoutes from './routes/scraper.js';
 import authRoutes from './routes/auth.js';
 import favoritesRoutes from './routes/favorites.js';
+import contentRoutes from './routes/content.js';
+import aiRoutes from './routes/ai.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { initDatabase, dataStore, getConnectionError } from './services/dataStore.js';
 import { requireSuperAdmin } from './middleware/auth.js';
@@ -109,6 +111,8 @@ app.use('/api/perfumes', perfumeRoutes);
 app.use('/api/scrape', scraperRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/favorites', favoritesRoutes);
+app.use('/api/content', contentRoutes);
+app.use('/api/ai', aiRoutes);
 
 // Error handler
 app.use(errorHandler);
