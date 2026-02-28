@@ -199,6 +199,18 @@ export const initDatabase = async () => {
 
     CREATE INDEX IF NOT EXISTS idx_favorites_user_id ON favorites(user_id);
     CREATE INDEX IF NOT EXISTS idx_favorites_perfume_id ON favorites(perfume_id);
+
+    -- ===== BRANDS TABLE (stores logo URLs scraped from Fragrantica) =====
+    CREATE TABLE IF NOT EXISTS brands (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name VARCHAR(255) UNIQUE NOT NULL,
+      logo_url TEXT,
+      fragrantica_url TEXT,
+      scraped_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_brands_name ON brands(name);
   `;
 
     try {
@@ -430,13 +442,17 @@ export const dataStore = {
         }
         const result = await pool.query(`
             SELECT
-                brand AS name,
+                p.brand AS name,
                 COUNT(*) AS count,
-                (SELECT image_url FROM perfumes p2 WHERE p2.brand = p.brand AND p2.image_url IS NOT NULL AND p2.image_url != '' ORDER BY p2.rating DESC NULLS LAST LIMIT 1) AS image_url
+                COALESCE(
+                    b.logo_url,
+                    (SELECT image_url FROM perfumes p2 WHERE p2.brand = p.brand AND p2.image_url IS NOT NULL AND p2.image_url != '' ORDER BY p2.rating DESC NULLS LAST LIMIT 1)
+                ) AS image_url
             FROM perfumes p
-            WHERE brand IS NOT NULL
-            GROUP BY brand
-            ORDER BY brand
+            LEFT JOIN brands b ON LOWER(b.name) = LOWER(p.brand)
+            WHERE p.brand IS NOT NULL
+            GROUP BY p.brand, b.logo_url
+            ORDER BY p.brand
         `);
         return result.rows.map((row) => ({
             name: row.name,
@@ -1068,6 +1084,78 @@ export const dataStore = {
             return result.rows.length > 0;
         } catch (err) {
             return false;
+        }
+    },
+
+    // ===== RESET METHODS =====
+
+    // Delete all perfumes (cascades to favorites)
+    clearPerfumes: async () => {
+        if (!isDatabaseConnected) {
+            const count = memoryStore.length;
+            memoryStore = [];
+            return { deleted: count };
+        }
+        try {
+            const result = await pool.query('DELETE FROM perfumes RETURNING id');
+            return { deleted: result.rowCount };
+        } catch (err) {
+            console.error('❌ clearPerfumes:', err.message);
+            throw err;
+        }
+    },
+
+    // Delete all brands
+    clearBrands: async () => {
+        if (!isDatabaseConnected) return { deleted: 0 };
+        try {
+            const result = await pool.query('DELETE FROM brands RETURNING id');
+            return { deleted: result.rowCount };
+        } catch (err) {
+            console.error('❌ clearBrands:', err.message);
+            throw err;
+        }
+    },
+
+    // ===== BRAND LOGO METHODS =====
+
+    // Upsert a brand with its logo URL
+    upsertBrand: async (name, logoUrl, fragranticaUrl) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                `INSERT INTO brands (name, logo_url, fragrantica_url)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (name) DO UPDATE SET
+                   logo_url = COALESCE($2, brands.logo_url),
+                   fragrantica_url = COALESCE($3, brands.fragrantica_url),
+                   scraped_at = NOW()
+                 RETURNING *`,
+                [name, logoUrl || null, fragranticaUrl || null]
+            );
+            return result.rows[0] || null;
+        } catch (err) {
+            console.error('❌ upsertBrand:', err.message);
+            return null;
+        }
+    },
+
+    // Get all stored brand logos
+    getBrandLogos: async () => {
+        if (!isDatabaseConnected) return [];
+        try {
+            const result = await pool.query(
+                'SELECT name, logo_url, fragrantica_url, scraped_at FROM brands ORDER BY name'
+            );
+            return result.rows.map(r => ({
+                name: r.name,
+                logoUrl: r.logo_url,
+                fragranticaUrl: r.fragrantica_url,
+                scrapedAt: r.scraped_at,
+            }));
+        } catch (err) {
+            console.error('❌ getBrandLogos:', err.message);
+            return [];
         }
     },
 };

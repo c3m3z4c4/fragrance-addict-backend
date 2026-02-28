@@ -145,14 +145,33 @@ async function fetchBrandUrls(brand, limit = 500) {
         await page.goto(brandUrl, { waitUntil: 'networkidle2', timeout: 60000 });
         await page.waitForSelector('a[href*="/perfume/"]', { timeout: 10000 }).catch(() => {});
 
+        // Extract brand logo — Fragrantica stores brand images in their CDN
+        const logoUrl = await page.evaluate(() => {
+            // Priority order: brand-specific CDN path, then any fimgs.net image
+            const selectors = [
+                'img[src*="/dizajneri/"]',
+                'img[src*="fimgs.net"][src*="/mdimg/"]',
+                '.brand-header img',
+                'header img',
+                '#main-content img',
+            ];
+            for (const sel of selectors) {
+                const img = document.querySelector(sel);
+                if (img?.src && !img.src.includes('logo') && img.naturalWidth > 50) return img.src;
+            }
+            // Fallback: first fimgs.net image (Fragrantica CDN)
+            const anyFimgs = document.querySelector('img[src*="fimgs.net"]');
+            return anyFimgs?.src || null;
+        }).catch(() => null);
+
         let urls = await page.evaluate(() =>
             Array.from(document.querySelectorAll('a[href*="/perfume/"]'))
                 .map(a => a.href)
                 .filter(h => h.includes('/perfume/') && !h.includes('#') && !h.includes('?') && /\/perfume\/[^/]+\/[^/]+\.html$/.test(h))
         );
         urls = [...new Set(urls)].slice(0, limit);
-        console.log(`  Found ${urls.length} URLs for brand "${brand}"`);
-        return { urls, brandUrl };
+        console.log(`  Found ${urls.length} URLs for brand "${brand}", logo: ${logoUrl ? 'yes' : 'no'}`);
+        return { urls, brandUrl, logoUrl };
     } finally {
         await browser.close();
     }
@@ -167,7 +186,7 @@ router.post('/brand', requireSuperAdmin, async (req, res, next) => {
             return next(new ApiError('Brand name is required', 400));
         }
 
-        const { urls, brandUrl } = await fetchBrandUrls(brand.trim(), parseInt(limit));
+        const { urls, brandUrl, logoUrl } = await fetchBrandUrls(brand.trim(), parseInt(limit));
 
         if (urls.length === 0) {
             return res.json({
@@ -178,6 +197,11 @@ router.post('/brand', requireSuperAdmin, async (req, res, next) => {
             });
         }
 
+        // Save brand logo to DB (even if no new URLs)
+        await dataStore.upsertBrand(brand.trim(), logoUrl, brandUrl).catch(err =>
+            console.warn(`⚠️ Could not save brand logo for "${brand}": ${err.message}`)
+        );
+
         // Filter already-existing URLs
         const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
         const newUrls = urls.filter(u => !existingUrls.has(u));
@@ -186,7 +210,7 @@ router.post('/brand', requireSuperAdmin, async (req, res, next) => {
         scrapingQueue.urls.push(...newUrls);
         scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
 
-        console.log(`📥 Brand "${brand}": ${newUrls.length} new, ${urls.length - newUrls.length} skipped`);
+        console.log(`📥 Brand "${brand}": ${newUrls.length} new, ${urls.length - newUrls.length} skipped, logo: ${logoUrl ? logoUrl.slice(0, 60) : 'none'}`);
 
         // Auto-start if requested and not already running
         if (autoStart && !scrapingQueue.processing && newUrls.length > 0) {
@@ -200,6 +224,7 @@ router.post('/brand', requireSuperAdmin, async (req, res, next) => {
             success: true,
             brand,
             brandUrl,
+            logoUrl,
             total: urls.length,
             queued: newUrls.length,
             skipped: urls.length - newUrls.length,
@@ -232,8 +257,13 @@ router.post('/brands', requireSuperAdmin, async (req, res, next) => {
         for (const brand of brands) {
             if (!brand || typeof brand !== 'string' || !brand.trim()) continue;
             try {
-                const { urls, brandUrl } = await fetchBrandUrls(brand.trim(), parseInt(limitPerBrand));
+                const { urls, brandUrl, logoUrl } = await fetchBrandUrls(brand.trim(), parseInt(limitPerBrand));
                 const newUrls = urls.filter(u => !existingUrls.has(u));
+
+                // Save brand logo to DB
+                await dataStore.upsertBrand(brand.trim(), logoUrl, brandUrl).catch(err =>
+                    console.warn(`⚠️ Could not save brand logo for "${brand}": ${err.message}`)
+                );
 
                 scrapingQueue.urls.push(...newUrls);
                 newUrls.forEach(u => existingUrls.add(u)); // avoid cross-brand dups
@@ -244,12 +274,13 @@ router.post('/brands', requireSuperAdmin, async (req, res, next) => {
                 results.push({
                     brand: brand.trim(),
                     brandUrl,
+                    logoUrl,
                     total: urls.length,
                     queued: newUrls.length,
                     skipped: urls.length - newUrls.length,
                 });
 
-                console.log(`📥 Brand "${brand}": ${newUrls.length} new queued`);
+                console.log(`📥 Brand "${brand}": ${newUrls.length} new queued, logo: ${logoUrl ? 'yes' : 'no'}`);
             } catch (err) {
                 results.push({ brand: brand.trim(), error: err.message, queued: 0 });
             }
@@ -807,6 +838,43 @@ router.post('/rescrape/queue', requireSuperAdmin, async (req, res, next) => {
         scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
 
         res.json({ success: true, added: urlsToAdd.length, queueSize: scrapingQueue.urls.length });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
+// POST /api/scrape/reset - Wipe ALL perfumes and brands (requires confirmation)
+router.post('/reset', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { confirm } = req.body;
+        if (confirm !== 'CONFIRM_RESET') {
+            return next(new ApiError('Send { confirm: "CONFIRM_RESET" } to proceed', 400));
+        }
+
+        // Stop scraping queue
+        scrapingQueue.processing = false;
+        scrapingQueue.urls = [];
+        scrapingQueue.processed = 0;
+        scrapingQueue.failed = 0;
+        scrapingQueue.total = 0;
+        scrapingQueue.current = null;
+        scrapingQueue.errors = [];
+
+        const [perfumesResult, brandsResult] = await Promise.all([
+            dataStore.clearPerfumes(),
+            dataStore.clearBrands(),
+        ]);
+
+        console.log(`🗑️ Reset: deleted ${perfumesResult.deleted} perfumes, ${brandsResult.deleted} brands`);
+
+        res.json({
+            success: true,
+            deleted: {
+                perfumes: perfumesResult.deleted,
+                brands: brandsResult.deleted,
+            },
+            message: 'All perfumes and brands have been deleted. Ready for fresh scraping.',
+        });
     } catch (error) {
         next(new ApiError(error.message, 500));
     }
