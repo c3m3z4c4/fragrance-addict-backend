@@ -36,15 +36,9 @@ function buildProfileBlock(profile) {
     return parts.length ? `User profile:\n${parts.map(p => `- ${p}`).join('\n')}` : '';
 }
 
-/** Format a perfume row for the catalog block (compact, token-efficient) */
+/** Format a perfume row for the catalog block — minimal for token efficiency */
 function formatCatalogEntry(p) {
-    const accords = (p.accords || []).slice(0, 3).join(', ');
-    const notes = [
-        ...(p.notes?.top || []),
-        ...(p.notes?.heart || []),
-    ].slice(0, 4).join(', ');
-    const extra = accords || notes;
-    return `- ${p.name} by ${p.brand}${p.concentration ? ` [${p.concentration}]` : ''}${p.gender ? ` (${p.gender})` : ''}${extra ? `: ${extra}` : ''}`;
+    return `${p.name} | ${p.brand}${p.concentration ? ` | ${p.concentration}` : ''}`;
 }
 
 /**
@@ -80,18 +74,19 @@ router.post('/recommendations', requireAuth, async (req, res, next) => {
         // Resolve DB gender filter from profile
         const dbGender = profile?.gender ? GENDER_MAP[profile.gender] : null;
 
-        // ── 1. Fetch catalog perfumes (up to 120, filtered by gender if provided) ──
+        // ── 1. Fetch catalog perfumes (up to 60, filtered by gender if provided) ──
         let catalogPerfumes = [];
         try {
             const catalogResult = await dataStore.getAll({
                 page: 1,
-                limit: 120,
+                limit: 60,
                 ...(dbGender ? { gender: dbGender } : {}),
                 sortBy: 'rating',
             });
             catalogPerfumes = catalogResult?.data || [];
-        } catch {
-            // Non-fatal — continue without catalog context
+            console.log(`📚 Catalog fetched: ${catalogPerfumes.length} perfumes${dbGender ? ` (${dbGender})` : ''}`);
+        } catch (err) {
+            console.error('⚠️ Catalog fetch failed (non-fatal):', err.message);
         }
 
         // ── 2. Fetch user's favourites ──
@@ -139,12 +134,14 @@ ${favoritesBlock}
 ${profileBlock ? `\n${profileBlock}` : ''}
 ${catalogBlock}`;
 
+        console.log(`🤖 Calling Gemini (${model}), prompt length: ${prompt.length} chars`);
+
         const geminiRes = await fetch(`${GEMINI_BASE}/${model}:generateContent?key=${apiKey}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.85, maxOutputTokens: 1400 },
+                generationConfig: { temperature: 0.85, maxOutputTokens: 2048 },
             }),
         });
 
@@ -155,19 +152,28 @@ ${catalogBlock}`;
         }
 
         const geminiData = await geminiRes.json();
-        const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+        const candidate = geminiData?.candidates?.[0];
+        const finishReason = candidate?.finishReason || 'UNKNOWN';
+        const rawText = candidate?.content?.parts?.[0]?.text || '';
+
+        console.log(`✅ Gemini response — finishReason: ${finishReason}, length: ${rawText.length}`);
+        if (!rawText) console.warn('⚠️ Gemini returned empty text. Full response:', JSON.stringify(geminiData).slice(0, 500));
 
         let recommendations;
         try {
             recommendations = JSON.parse(rawText).recommendations || [];
         } catch {
-            const match = rawText.match(/\{[\s\S]*\}/);
+            // Gemini sometimes wraps JSON in markdown fences
+            const match = rawText.match(/```(?:json)?\s*([\s\S]*?)```/) || rawText.match(/(\{[\s\S]*\})/);
             try {
-                recommendations = match ? JSON.parse(match[0]).recommendations || [] : [];
+                const jsonStr = match?.[1] ?? match?.[0] ?? '{}';
+                recommendations = JSON.parse(jsonStr).recommendations || [];
             } catch {
+                console.error('❌ Failed to parse Gemini response:', rawText.slice(0, 300));
                 recommendations = [];
             }
         }
+        console.log(`📋 Parsed ${recommendations.length} recommendations`);
 
         res.json({
             success: true,
