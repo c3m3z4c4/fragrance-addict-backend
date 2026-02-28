@@ -126,6 +126,7 @@ export const initDatabase = async () => {
       longevity JSONB,
       projection VARCHAR(50),
       similar_perfumes JSONB DEFAULT '[]',
+      season_usage JSONB DEFAULT NULL,
       source_url TEXT,
       scraped_at TIMESTAMP WITH TIME ZONE,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -150,6 +151,9 @@ export const initDatabase = async () => {
       END IF;
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='perfumes' AND column_name='similar_perfumes') THEN
         ALTER TABLE perfumes ADD COLUMN similar_perfumes JSONB DEFAULT '[]';
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='perfumes' AND column_name='season_usage') THEN
+        ALTER TABLE perfumes ADD COLUMN season_usage JSONB DEFAULT NULL;
       END IF;
     END $$;
 
@@ -478,8 +482,8 @@ export const dataStore = {
         }
 
         const query = `
-      INSERT INTO perfumes (id, name, brand, year, perfumer, gender, concentration, notes, accords, description, image_url, rating, sillage, longevity, projection, similar_perfumes, source_url, scraped_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+      INSERT INTO perfumes (id, name, brand, year, perfumer, gender, concentration, notes, accords, description, image_url, rating, sillage, longevity, projection, similar_perfumes, season_usage, source_url, scraped_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
       RETURNING *
     `;
         const values = [
@@ -499,6 +503,7 @@ export const dataStore = {
             JSON.stringify(perfume.longevity || null),
             perfume.projection || null,
             JSON.stringify(perfume.similarPerfumes || []),
+            perfume.seasonUsage ? JSON.stringify(perfume.seasonUsage) : null,
             perfume.sourceUrl || null,
             perfume.scrapedAt || null,
         ];
@@ -540,6 +545,7 @@ export const dataStore = {
             longevity: 'longevity',
             projection: 'projection',
             similarPerfumes: 'similar_perfumes',
+            seasonUsage: 'season_usage',
             sourceUrl: 'source_url',
             scrapedAt: 'scraped_at',
         };
@@ -550,6 +556,7 @@ export const dataStore = {
             'sillage',
             'longevity',
             'similarPerfumes',
+            'seasonUsage',
         ];
 
         for (const [key, column] of Object.entries(fieldMap)) {

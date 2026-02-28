@@ -104,6 +104,7 @@ export const scrapePerfume = async (url) => {
             description: extractDescription($),
             imageUrl: extractImage($),
             rating: extractRating($),
+            seasonUsage: extractSeasonUsage($),
             sourceUrl: url,
             scrapedAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
@@ -570,6 +571,76 @@ function extractImage($) {
 }
 
 // Extraer rating
+function extractSeasonUsage($) {
+    const result = { winter: 0, spring: 0, summer: 0, autumn: 0, day: 0, night: 0 };
+    let found = false;
+
+    // Fragrantica season/time keywords → internal key
+    const keyMap = {
+        winter: 'winter', invierno: 'winter',
+        spring: 'spring', primavera: 'spring',
+        summer: 'summer', verano: 'summer',
+        fall: 'autumn', autumn: 'autumn', 'otoño': 'autumn', otono: 'autumn',
+        day: 'day', daytime: 'day', 'día': 'day', dia: 'day',
+        night: 'night', noche: 'night', evening: 'night',
+    };
+
+    const parseVotes = (str) => {
+        const s = str.trim().replace(/,/g, '').toLowerCase();
+        if (!s) return 0;
+        if (s.endsWith('k')) return parseFloat(s) * 1000;
+        const n = parseFloat(s);
+        return isNaN(n) ? 0 : n;
+    };
+
+    // Strategy 1: vote-button elements with season/time in class or text
+    $('[class*="vote-button"], [class*="season"], [class*="accord-season"]').each((_, el) => {
+        const $el = $(el);
+        const cls = ($el.attr('class') || '').toLowerCase();
+        const txt = $el.text().toLowerCase();
+
+        for (const [kw, key] of Object.entries(keyMap)) {
+            if (cls.includes(kw) || txt.includes(kw)) {
+                const numMatch = txt.match(/([\d]+(?:[.,]\d+)?k?)/i);
+                if (numMatch) {
+                    const n = parseVotes(numMatch[1]);
+                    if (n > 0) { result[key] = Math.max(result[key], n); found = true; }
+                }
+            }
+        }
+    });
+
+    // Strategy 2: look for any element whose direct text is a season keyword,
+    // then find adjacent numeric text
+    if (!found) {
+        $('span, div, p, td, li').each((_, el) => {
+            const $el = $(el);
+            const own = $el.clone().children().remove().end().text().trim().toLowerCase();
+            const key = keyMap[own];
+            if (!key) return;
+
+            // look for numeric value in parent or siblings
+            [$el.next(), $el.prev(), $el.parent().children()].forEach($candidates => {
+                $candidates.each((__, c) => {
+                    const n = parseVotes($(c).text());
+                    if (n > 0) { result[key] = Math.max(result[key], n); found = true; }
+                });
+            });
+        });
+    }
+
+    if (!found) return null;
+
+    // Convert raw counts to 0-100 scores (relative to max)
+    const max = Math.max(...Object.values(result));
+    if (max === 0) return null;
+    const normalized = {};
+    for (const [k, v] of Object.entries(result)) {
+        normalized[k] = Math.round((v / max) * 100);
+    }
+    return normalized;
+}
+
 function extractRating($) {
     // Fragrantica muestra ratings de diferentes formas
     const ratingSelectors = [
