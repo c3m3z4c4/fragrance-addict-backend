@@ -5,7 +5,16 @@ import { ApiError } from '../middleware/errorHandler.js';
 
 const router = Router();
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+const ALLOWED_MODELS = [
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-lite',
+    'gemini-flash-latest',
+];
+const DEFAULT_MODEL = 'gemini-2.5-flash';
 
 /** Returns true if the user is eligible for Gemini features (Gmail or Google OAuth) */
 function isGmailUser(user) {
@@ -13,9 +22,16 @@ function isGmailUser(user) {
 }
 
 /**
- * GET /api/ai/recommendations
+ * GET /api/ai/models
+ * Returns the list of supported models.
+ */
+router.get('/models', requireAuth, (_req, res) => {
+    res.json({ models: ALLOWED_MODELS, default: DEFAULT_MODEL });
+});
+
+/**
+ * GET /api/ai/recommendations?model=gemini-2.5-flash
  * Requires JWT auth + Gmail/Google account.
- * Uses the user's favorite perfumes to build a personalised Gemini prompt.
  */
 router.get('/recommendations', requireAuth, async (req, res, next) => {
     try {
@@ -27,6 +43,12 @@ router.get('/recommendations', requireAuth, async (req, res, next) => {
         if (!isGmailUser(req.user)) {
             return next(new ApiError('Gemini recommendations are available for Google/Gmail users only', 403));
         }
+
+        // Validate requested model
+        const requestedModel = req.query.model;
+        const model = (requestedModel && ALLOWED_MODELS.includes(requestedModel))
+            ? requestedModel
+            : DEFAULT_MODEL;
 
         // Fetch user's favourites from DB
         const favorites = await dataStore.getUserFavorites(req.user.id);
@@ -53,7 +75,7 @@ ${contextBlock}
 
 User email: ${req.user.email}`;
 
-        const geminiRes = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
+        const geminiRes = await fetch(`${GEMINI_BASE}/${model}:generateContent?key=${apiKey}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -64,8 +86,8 @@ User email: ${req.user.email}`;
 
         if (!geminiRes.ok) {
             const errText = await geminiRes.text();
-            console.error('❌ Gemini API error:', errText);
-            return next(new ApiError('Gemini API request failed', 502));
+            console.error(`❌ Gemini API error (model: ${model}):`, errText);
+            return next(new ApiError(`Gemini API request failed (model: ${model})`, 502));
         }
 
         const geminiData = await geminiRes.json();
@@ -75,7 +97,6 @@ User email: ${req.user.email}`;
         try {
             recommendations = JSON.parse(rawText).recommendations || [];
         } catch {
-            // Try to extract JSON if Gemini wrapped it in markdown
             const match = rawText.match(/\{[\s\S]*\}/);
             try {
                 recommendations = match ? JSON.parse(match[0]).recommendations || [] : [];
@@ -88,6 +109,7 @@ User email: ${req.user.email}`;
             success: true,
             recommendations,
             basedOnFavorites: favorites?.length || 0,
+            model,
         });
     } catch (err) {
         next(err);
