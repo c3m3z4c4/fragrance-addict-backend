@@ -21,6 +21,18 @@ function isGmailUser(user) {
     return user.provider === 'google' || (user.email && user.email.toLowerCase().endsWith('@gmail.com'));
 }
 
+/** Build a human-readable profile block from optional user profile data */
+function buildProfileBlock(profile) {
+    if (!profile) return '';
+    const parts = [];
+    if (profile.ageRange) parts.push(`Age range: ${profile.ageRange}`);
+    if (profile.gender)   parts.push(`Gender: ${profile.gender}`);
+    if (profile.occasions?.length) parts.push(`Preferred occasions: ${profile.occasions.join(', ')}`);
+    if (profile.seasons?.length)   parts.push(`Preferred seasons: ${profile.seasons.join(', ')}`);
+    if (profile.intensity) parts.push(`Preferred intensity: ${profile.intensity}`);
+    return parts.length ? `\nUser profile:\n${parts.map(p => `- ${p}`).join('\n')}` : '';
+}
+
 /**
  * GET /api/ai/models
  * Returns the list of supported models.
@@ -30,10 +42,11 @@ router.get('/models', requireAuth, (_req, res) => {
 });
 
 /**
- * GET /api/ai/recommendations?model=gemini-2.5-flash
+ * POST /api/ai/recommendations
+ * Body: { model?: string, profile?: { ageRange, gender, occasions, seasons, intensity } }
  * Requires JWT auth + Gmail/Google account.
  */
-router.get('/recommendations', requireAuth, async (req, res, next) => {
+router.post('/recommendations', requireAuth, async (req, res, next) => {
     try {
         const apiKey = process.env.GEMINI_API_KEY;
         if (!apiKey) {
@@ -45,15 +58,17 @@ router.get('/recommendations', requireAuth, async (req, res, next) => {
         }
 
         // Validate requested model
-        const requestedModel = req.query.model;
+        const requestedModel = req.body?.model;
         const model = (requestedModel && ALLOWED_MODELS.includes(requestedModel))
             ? requestedModel
             : DEFAULT_MODEL;
 
+        const profile = req.body?.profile || null;
+
         // Fetch user's favourites from DB
         const favorites = await dataStore.getUserFavorites(req.user.id);
 
-        let contextBlock;
+        let favoritesBlock;
         if (favorites && favorites.length > 0) {
             const lines = favorites.map((p) => {
                 const notes = [
@@ -64,23 +79,24 @@ router.get('/recommendations', requireAuth, async (req, res, next) => {
                 const accords = (p.accords || []).slice(0, 4).join(', ');
                 return `- ${p.name} by ${p.brand}${p.concentration ? ` (${p.concentration})` : ''}${notes ? `: notes of ${notes}` : ''}${accords ? `; accords: ${accords}` : ''}`;
             });
-            contextBlock = `The user's favourite perfumes are:\n${lines.join('\n')}`;
+            favoritesBlock = `Favourite perfumes:\n${lines.join('\n')}`;
         } else {
-            contextBlock = 'The user has not yet saved any favourite perfumes.';
+            favoritesBlock = 'The user has not yet saved any favourite perfumes.';
         }
 
-        const prompt = `You are an expert perfume sommelier. Based on the information below, suggest exactly 5 perfumes the user would love that are NOT already in their favourites list. For each suggestion provide: name, brand, a one-sentence reason why it suits this user, and 2-3 key accords/notes. Respond in JSON with this shape: {"recommendations":[{"name":"...","brand":"...","reason":"...","keyNotes":["...","..."]}]}. Do not include markdown fences, only raw JSON.
+        const profileBlock = buildProfileBlock(profile);
 
-${contextBlock}
+        const prompt = `You are an expert perfume sommelier. Based on the user information below, suggest exactly 5 perfumes they would love that are NOT already in their favourites list. Tailor each recommendation to their profile and taste. For each suggestion provide: name, brand, a one-sentence reason why it suits this specific user, and 2-3 key accords/notes. Respond in JSON with this shape: {"recommendations":[{"name":"...","brand":"...","reason":"...","keyNotes":["...","..."]}]}. Do not include markdown fences, only raw JSON.
 
-User email: ${req.user.email}`;
+${favoritesBlock}
+${profileBlock}`;
 
         const geminiRes = await fetch(`${GEMINI_BASE}/${model}:generateContent?key=${apiKey}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.8, maxOutputTokens: 1024 },
+                generationConfig: { temperature: 0.85, maxOutputTokens: 1200 },
             }),
         });
 
