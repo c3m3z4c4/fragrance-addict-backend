@@ -971,118 +971,115 @@ router.post('/reset', requireSuperAdmin, async (req, res, next) => {
 });
 
 // POST /api/scrape/catalog/full - Discover & queue ALL perfumes from Fragrantica sitemaps
-router.post('/catalog/full', requireSuperAdmin, async (req, res, next) => {
-    try {
-        const { autoStart = true } = req.body;
+// Responds immediately (202) to avoid Traefik timeout; discovery runs in background.
+router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
+    const { autoStart = true } = req.body;
 
-        console.log('🌍 Full catalog import: reading Fragrantica sitemaps via Puppeteer...');
+    // Respond immediately so Traefik doesn't cut the connection (discovery takes minutes)
+    res.json({
+        success: true,
+        status: 'discovering',
+        message: 'Sitemap discovery started in background. URLs will be added to the queue as they are found — check the queue panel below.',
+        sitemapsDiscovered: 0,
+        totalFound: 0,
+        newQueued: 0,
+        alreadyExist: 0,
+        estimatedHours: 0,
+        estimatedDays: 0,
+        autoStarted: false,
+    });
 
-        const puppeteer = (await import('puppeteer')).default;
-        const browser = await puppeteer.launch({
-            headless: 'new',
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-        });
-
-        const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-
-        const fetchXml = async (url) => {
-            const page = await browser.newPage();
-            try {
-                await page.setUserAgent(BROWSER_UA);
-                await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-                await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-                return await page.content();
-            } finally {
-                await page.close();
-            }
-        };
-
-        // ── 1. Discover sub-sitemap files from the index ──
-        let sitemapUrls = [];
+    // Run discovery asynchronously after the response is sent
+    setImmediate(async () => {
+        console.log('🌍 [bg] Full catalog import: reading Fragrantica sitemaps via Puppeteer...');
+        let browser = null;
         try {
-            const indexXml = await fetchXml('https://www.fragrantica.com/sitemap.xml');
-            const matches = indexXml.match(/https?:\/\/[^\s<>"]*sitemap_perfumes_\d+\.xml/g) || [];
-            sitemapUrls = [...new Set(matches)];
-            console.log(`  → Sitemap index: found ${sitemapUrls.length} perfume sub-sitemaps`);
-        } catch (err) {
-            console.warn(`  ⚠️ Could not fetch sitemap.xml: ${err.message}`);
-        }
+            const puppeteer = (await import('puppeteer')).default;
+            browser = await puppeteer.launch({
+                headless: 'new',
+                executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+            });
 
-        // Fallback: probe known numbered sitemap paths (Fragrantica uses sitemap_perfumes_1.xml … N.xml)
-        if (sitemapUrls.length === 0) {
-            for (let i = 1; i <= 6; i++) {
-                sitemapUrls.push(`https://www.fragrantica.com/sitemap_perfumes_${i}.xml`);
-            }
-            console.log(`  → Fallback: probing ${sitemapUrls.length} candidate sub-sitemap URLs`);
-        }
+            const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-        // ── 2. Extract perfume URLs from each sub-sitemap ──
-        const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
-        const allFound = [];
-        let foundSitemaps = 0;
-
-        for (const sitemapUrl of sitemapUrls) {
-            try {
-                const xml = await fetchXml(sitemapUrl);
-                const urls = (xml.match(/https?:\/\/[^\s<>"]*\/perfume\/[^<\s"]+\.html/g) || [])
-                    .filter(u => /\/perfume\/[^/]+\/[^/]+\.html$/.test(u));
-                if (urls.length > 0) {
-                    allFound.push(...urls);
-                    foundSitemaps++;
-                    console.log(`  → ${sitemapUrl}: ${urls.length} URLs`);
-                } else {
-                    console.log(`  → ${sitemapUrl}: 0 URLs (empty or blocked)`);
+            const fetchXml = async (url) => {
+                const page = await browser.newPage();
+                try {
+                    await page.setUserAgent(BROWSER_UA);
+                    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+                    await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+                    return await page.content();
+                } finally {
+                    await page.close();
                 }
+            };
+
+            // ── 1. Discover sub-sitemap files from the index ──
+            let sitemapUrls = [];
+            try {
+                const indexXml = await fetchXml('https://www.fragrantica.com/sitemap.xml');
+                const matches = indexXml.match(/https?:\/\/[^\s<>"]*sitemap_perfumes_\d+\.xml/g) || [];
+                sitemapUrls = [...new Set(matches)];
+                console.log(`  [bg] Sitemap index: found ${sitemapUrls.length} perfume sub-sitemaps`);
             } catch (err) {
-                console.warn(`  ⚠️ Skipping ${sitemapUrl}: ${err.message}`);
+                console.warn(`  [bg] ⚠️ Could not fetch sitemap.xml: ${err.message}`);
             }
+
+            // Fallback: probe known numbered paths (Fragrantica uses sitemap_perfumes_1.xml … N.xml)
+            if (sitemapUrls.length === 0) {
+                for (let i = 1; i <= 6; i++) {
+                    sitemapUrls.push(`https://www.fragrantica.com/sitemap_perfumes_${i}.xml`);
+                }
+                console.log(`  [bg] Fallback: probing ${sitemapUrls.length} candidate sub-sitemap URLs`);
+            }
+
+            // ── 2. Extract perfume URLs from each sub-sitemap ──
+            const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
+            const allFound = [];
+
+            for (const sitemapUrl of sitemapUrls) {
+                try {
+                    const xml = await fetchXml(sitemapUrl);
+                    const urls = (xml.match(/https?:\/\/[^\s<>"]*\/perfume\/[^<\s"]+\.html/g) || [])
+                        .filter(u => /\/perfume\/[^/]+\/[^/]+\.html$/.test(u));
+                    if (urls.length > 0) {
+                        allFound.push(...urls);
+                        console.log(`  [bg] ${sitemapUrl}: ${urls.length} URLs`);
+                    } else {
+                        console.log(`  [bg] ${sitemapUrl}: 0 URLs (empty or blocked)`);
+                    }
+                } catch (err) {
+                    console.warn(`  [bg] ⚠️ Skipping ${sitemapUrl}: ${err.message}`);
+                }
+            }
+
+            if (allFound.length === 0) {
+                console.error('[bg] ❌ Full catalog: no URLs found from any sitemap. Fragrantica may be blocking access.');
+                return;
+            }
+
+            const uniqueUrls = [...new Set(allFound)];
+            const newUrls = uniqueUrls.filter(u => !existingUrls.has(u));
+
+            // ── 3. Add new URLs to queue ──
+            scrapingQueue.urls.push(...newUrls);
+            scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+
+            if (autoStart && !scrapingQueue.processing && newUrls.length > 0) {
+                scrapingQueue.processing = true;
+                scrapingQueue.startedAt = new Date().toISOString();
+                scrapingQueue.errors = [];
+                processQueue();
+            }
+
+            console.log(`✅ [bg] Full catalog done: ${uniqueUrls.length} unique found, ${newUrls.length} new queued, ${uniqueUrls.length - newUrls.length} already existed`);
+        } catch (err) {
+            console.error('[bg] ❌ Full catalog discovery error:', err.message);
+        } finally {
+            if (browser) await browser.close().catch(() => {});
         }
-
-        await browser.close();
-
-        if (allFound.length === 0) {
-            return next(new ApiError(
-                'Could not retrieve perfume URLs from Fragrantica sitemaps. The site may be temporarily blocking access — try again in a few minutes.',
-                502
-            ));
-        }
-
-        const uniqueUrls = [...new Set(allFound)];
-        const newUrls = uniqueUrls.filter(u => !existingUrls.has(u));
-
-        // ── 3. Add new URLs to queue ──
-        scrapingQueue.urls.push(...newUrls);
-        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
-
-        let autoStarted = false;
-        if (autoStart && !scrapingQueue.processing && newUrls.length > 0) {
-            scrapingQueue.processing = true;
-            scrapingQueue.startedAt = new Date().toISOString();
-            scrapingQueue.errors = [];
-            processQueue();
-            autoStarted = true;
-        }
-
-        const estimatedHours = Math.round((newUrls.length * 15) / 3600);
-        const estimatedDays = Math.round((newUrls.length * 15) / 86400);
-
-        console.log(`✅ Full catalog: found ${uniqueUrls.length} unique, ${newUrls.length} new queued, ${uniqueUrls.length - newUrls.length} already exist`);
-
-        res.json({
-            success: true,
-            sitemapsDiscovered: foundSitemaps,
-            totalFound: uniqueUrls.length,
-            newQueued: newUrls.length,
-            alreadyExist: uniqueUrls.length - newUrls.length,
-            queueSize: scrapingQueue.urls.length,
-            estimatedHours,
-            estimatedDays,
-            autoStarted,
-        });
-    } catch (error) {
-        next(new ApiError(error.message, 500));
-    }
+    });
 });
 
 // GET /api/scrape/cache/stats - Estadísticas del caché
