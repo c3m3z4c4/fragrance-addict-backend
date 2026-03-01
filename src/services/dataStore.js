@@ -244,6 +244,19 @@ export const initDatabase = async () => {
       value JSONB NOT NULL DEFAULT '{}',
       updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
+
+    -- ===== SCRAPE QUEUE TABLE (persistent scraping queue, survives restarts) =====
+    CREATE TABLE IF NOT EXISTS scrape_queue (
+      id BIGSERIAL PRIMARY KEY,
+      url TEXT UNIQUE NOT NULL,
+      status VARCHAR(20) DEFAULT 'pending',
+      retry_count SMALLINT DEFAULT 0,
+      error_msg TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_scrape_queue_status ON scrape_queue(status);
+    CREATE INDEX IF NOT EXISTS idx_scrape_queue_pending ON scrape_queue(created_at) WHERE status = 'pending';
   `;
 
     try {
@@ -506,6 +519,106 @@ export const dataStore = {
             'SELECT source_url FROM perfumes WHERE source_url IS NOT NULL'
         );
         return result.rows.map((row) => row.source_url);
+    },
+
+    // ── Scrape Queue (persistent) ──────────────────────────────────────────────
+
+    // Add URLs to the queue (skip already queued/done)
+    queueEnqueue: async (urls) => {
+        if (!isDatabaseConnected || !urls.length) return 0;
+        const values = urls.map((_, i) => `($${i + 1})`).join(', ');
+        const result = await pool.query(
+            `INSERT INTO scrape_queue (url) VALUES ${values} ON CONFLICT (url) DO NOTHING`,
+            urls
+        );
+        return result.rowCount;
+    },
+
+    // Atomically claim next pending URL → marks it 'processing', returns url or null
+    queueDequeue: async () => {
+        if (!isDatabaseConnected) return null;
+        const result = await pool.query(`
+            UPDATE scrape_queue SET status = 'processing', updated_at = NOW()
+            WHERE id = (
+                SELECT id FROM scrape_queue
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING url
+        `);
+        return result.rows[0]?.url || null;
+    },
+
+    // Mark a queued URL as done / failed
+    queueMark: async (url, status, errorMsg = null) => {
+        if (!isDatabaseConnected) return;
+        await pool.query(
+            `UPDATE scrape_queue SET status = $1, error_msg = $2, updated_at = NOW() WHERE url = $3`,
+            [status, errorMsg, url]
+        );
+    },
+
+    // Reset stuck 'processing' entries to 'pending' (call on startup)
+    queueResetStuck: async () => {
+        if (!isDatabaseConnected) return 0;
+        const result = await pool.query(
+            `UPDATE scrape_queue SET status = 'pending', updated_at = NOW() WHERE status = 'processing'`
+        );
+        return result.rowCount;
+    },
+
+    // Retry all failed entries
+    queueRetryFailed: async () => {
+        if (!isDatabaseConnected) return 0;
+        const result = await pool.query(
+            `UPDATE scrape_queue SET status = 'pending', error_msg = NULL, retry_count = retry_count + 1, updated_at = NOW() WHERE status = 'failed'`
+        );
+        return result.rowCount;
+    },
+
+    // Check if a source URL already has a record in perfumes table
+    existsBySourceUrl: async (url) => {
+        if (!isDatabaseConnected) return false;
+        const result = await pool.query(
+            'SELECT 1 FROM perfumes WHERE source_url = $1 LIMIT 1',
+            [url]
+        );
+        return result.rows.length > 0;
+    },
+
+    // Get queue stats grouped by status
+    queueStats: async () => {
+        if (!isDatabaseConnected) return { pending: 0, processing: 0, done: 0, failed: 0, total: 0 };
+        const result = await pool.query(
+            `SELECT status, COUNT(*)::int AS count FROM scrape_queue GROUP BY status`
+        );
+        const stats = { pending: 0, processing: 0, done: 0, failed: 0, total: 0 };
+        for (const row of result.rows) {
+            stats[row.status] = row.count;
+            stats.total += row.count;
+        }
+        return stats;
+    },
+
+    // Get recent failed URLs with their error messages
+    queueGetFailed: async (limit = 20) => {
+        if (!isDatabaseConnected) return [];
+        const result = await pool.query(
+            `SELECT url, error_msg, retry_count, updated_at FROM scrape_queue WHERE status = 'failed' ORDER BY updated_at DESC LIMIT $1`,
+            [limit]
+        );
+        return result.rows;
+    },
+
+    // Clear all queue entries (or by status)
+    queueClear: async (status = null) => {
+        if (!isDatabaseConnected) return 0;
+        const result = status
+            ? await pool.query(`DELETE FROM scrape_queue WHERE status = $1`, [status])
+            : await pool.query(`DELETE FROM scrape_queue`);
+        return result.rowCount;
     },
 
     // Obtener por ID

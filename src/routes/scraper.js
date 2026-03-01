@@ -26,16 +26,41 @@ const isValidUrl = (string) => {
 };
 
 // Estado de la cola de scraping
+// In-memory state for the active scraping session (stats & control flags).
+// The actual URL list lives in the scrape_queue DB table so it survives restarts.
 let scrapingQueue = {
-    urls: [],
     processing: false,
     current: null,
+    processedThisSession: 0,
+    failedThisSession: 0,
+    startedAt: null,
+    errors: [],          // last ~20 errors for display
+    // Legacy in-memory list (used only when DB not available)
+    urls: [],
+    total: 0,
     processed: 0,
     failed: 0,
-    total: 0,
-    startedAt: null,
-    errors: [],
 };
+
+/** Enqueue URLs into DB and optionally start processing. Returns count added. */
+async function enqueueUrls(urls, autoStart = false) {
+    const added = await dataStore.queueEnqueue(urls).catch(() => {
+        // DB unavailable — fall back to in-memory
+        const newUrls = urls.filter(u => !scrapingQueue.urls.includes(u));
+        scrapingQueue.urls.push(...newUrls);
+        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+        return newUrls.length;
+    });
+    if (autoStart && !scrapingQueue.processing && added > 0) {
+        scrapingQueue.processing = true;
+        scrapingQueue.startedAt = new Date().toISOString();
+        scrapingQueue.processedThisSession = 0;
+        scrapingQueue.failedThisSession = 0;
+        scrapingQueue.errors = [];
+        processQueue();
+    }
+    return added;
+}
 
 // GET /api/scrape/perfume?url=... - Scrapear un perfume
 router.get('/perfume', requireSuperAdmin, scrapeLimiter, async (req, res, next) => {
@@ -202,34 +227,23 @@ router.post('/brand', requireSuperAdmin, async (req, res, next) => {
             console.warn(`⚠️ Could not save brand logo for "${brand}": ${err.message}`)
         );
 
-        // Filter already-existing URLs
-        const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
-        const newUrls = urls.filter(u => !existingUrls.has(u));
+        // Add to persistent DB queue (ON CONFLICT DO NOTHING deduplicates)
+        const added = await enqueueUrls(urls, autoStart);
+        const skipped = urls.length - added;
 
-        // Add to queue
-        scrapingQueue.urls.push(...newUrls);
-        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+        console.log(`📥 Brand "${brand}": ${added} queued, ${skipped} already in queue/db, logo: ${logoUrl ? logoUrl.slice(0, 60) : 'none'}`);
 
-        console.log(`📥 Brand "${brand}": ${newUrls.length} new, ${urls.length - newUrls.length} skipped, logo: ${logoUrl ? logoUrl.slice(0, 60) : 'none'}`);
-
-        // Auto-start if requested and not already running
-        if (autoStart && !scrapingQueue.processing && newUrls.length > 0) {
-            scrapingQueue.processing = true;
-            scrapingQueue.startedAt = new Date().toISOString();
-            scrapingQueue.errors = [];
-            processQueue();
-        }
-
+        const stats = await dataStore.queueStats().catch(() => ({}));
         res.json({
             success: true,
             brand,
             brandUrl,
             logoUrl,
             total: urls.length,
-            queued: newUrls.length,
-            skipped: urls.length - newUrls.length,
-            queueSize: scrapingQueue.urls.length,
-            autoStarted: autoStart && newUrls.length > 0,
+            queued: added,
+            skipped,
+            queueSize: stats.pending ?? added,
+            autoStarted: autoStart && added > 0,
         });
     } catch (error) {
         next(new ApiError(error.message, 500));
@@ -265,42 +279,43 @@ router.post('/brands', requireSuperAdmin, async (req, res, next) => {
                     console.warn(`⚠️ Could not save brand logo for "${brand}": ${err.message}`)
                 );
 
-                scrapingQueue.urls.push(...newUrls);
-                newUrls.forEach(u => existingUrls.add(u)); // avoid cross-brand dups
+                const added = await enqueueUrls(newUrls, false);
+                newUrls.forEach(u => existingUrls.add(u)); // avoid cross-brand dups within this request
 
-                totalQueued += newUrls.length;
-                totalSkipped += urls.length - newUrls.length;
+                totalQueued += added;
+                totalSkipped += urls.length - added;
 
                 results.push({
                     brand: brand.trim(),
                     brandUrl,
                     logoUrl,
                     total: urls.length,
-                    queued: newUrls.length,
-                    skipped: urls.length - newUrls.length,
+                    queued: added,
+                    skipped: urls.length - added,
                 });
 
-                console.log(`📥 Brand "${brand}": ${newUrls.length} new queued, logo: ${logoUrl ? 'yes' : 'no'}`);
+                console.log(`📥 Brand "${brand}": ${added} queued, logo: ${logoUrl ? 'yes' : 'no'}`);
             } catch (err) {
                 results.push({ brand: brand.trim(), error: err.message, queued: 0 });
             }
         }
 
-        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
-
         if (autoStart && !scrapingQueue.processing && totalQueued > 0) {
             scrapingQueue.processing = true;
             scrapingQueue.startedAt = new Date().toISOString();
+            scrapingQueue.processedThisSession = 0;
+            scrapingQueue.failedThisSession = 0;
             scrapingQueue.errors = [];
             processQueue();
         }
 
+        const stats = await dataStore.queueStats().catch(() => ({}));
         res.json({
             success: true,
             brands: results,
             totalQueued,
             totalSkipped,
-            queueSize: scrapingQueue.urls.length,
+            queueSize: stats.pending ?? totalQueued,
             autoStarted: autoStart && totalQueued > 0,
         });
     } catch (error) {
@@ -550,23 +565,17 @@ router.post('/queue', requireSuperAdmin, async (req, res, next) => {
             );
         }
 
-        const newUrls = validUrls.filter((url) => !existingUrls.has(url));
+        const added = await enqueueUrls(validUrls, false);
+        const skipped = validUrls.length - added;
 
-        scrapingQueue.urls.push(...newUrls);
-        scrapingQueue.total =
-            scrapingQueue.urls.length + scrapingQueue.processed;
+        console.log(`📥 Added ${added} URLs to queue (${skipped} already in queue/db)`);
 
-        console.log(
-            `📥 Added ${newUrls.length} URLs to queue (${
-                validUrls.length - newUrls.length
-            } duplicates skipped)`
-        );
-
+        const stats = await dataStore.queueStats().catch(() => ({}));
         res.json({
             success: true,
-            added: newUrls.length,
-            skipped: validUrls.length - newUrls.length,
-            queueSize: scrapingQueue.urls.length,
+            added,
+            skipped,
+            queueSize: stats.pending ?? added,
         });
     } catch (error) {
         console.error('Queue error:', error);
@@ -574,181 +583,185 @@ router.post('/queue', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
-// POST /api/scrape/queue/start - Start processing the queue
+// POST /api/scrape/queue/start - Start (or resume) processing the DB-backed queue
 router.post('/queue/start', requireSuperAdmin, async (req, res, next) => {
     try {
         if (scrapingQueue.processing) {
-            return res.json({
-                success: false,
-                message: 'Queue already processing',
-            });
+            return res.json({ success: false, message: 'Queue already processing' });
         }
 
-        if (scrapingQueue.urls.length === 0) {
-            return res.json({ success: false, message: 'Queue is empty' });
+        // Reset any URLs stuck in 'processing' state from a previous crash
+        const stuck = await dataStore.queueResetStuck().catch(() => 0);
+        if (stuck > 0) console.log(`♻️ Reset ${stuck} stuck URLs to pending`);
+
+        const stats = await dataStore.queueStats().catch(() => ({ pending: 0 }));
+        if (stats.pending === 0) {
+            return res.json({ success: false, message: 'No pending URLs in queue' });
         }
 
         scrapingQueue.processing = true;
         scrapingQueue.startedAt = new Date().toISOString();
+        scrapingQueue.processedThisSession = 0;
+        scrapingQueue.failedThisSession = 0;
         scrapingQueue.errors = [];
 
-        console.log(
-            `🚀 Starting queue processing: ${scrapingQueue.urls.length} URLs`
-        );
-
-        // Start processing in background
+        console.log(`🚀 Starting queue: ${stats.pending} pending URLs`);
         processQueue();
 
-        res.json({
-            success: true,
-            message: 'Queue processing started',
-            queueSize: scrapingQueue.urls.length,
-        });
+        res.json({ success: true, message: 'Queue processing started', pending: stats.pending });
     } catch (error) {
         next(new ApiError(error.message, 500));
     }
 });
 
-// POST /api/scrape/queue/stop - Stop processing the queue
-router.post('/queue/stop', requireSuperAdmin, (req, res) => {
+// POST /api/scrape/queue/stop - Pause queue (pending URLs stay in DB, resume any time)
+router.post('/queue/stop', requireSuperAdmin, async (req, res) => {
     scrapingQueue.processing = false;
-    console.log('⏹️ Queue processing stopped');
-
+    console.log('⏸️ Queue paused');
+    const stats = await dataStore.queueStats().catch(() => ({}));
     res.json({
         success: true,
-        message: 'Queue processing stopped',
-        processed: scrapingQueue.processed,
-        remaining: scrapingQueue.urls.length,
+        message: 'Queue paused — resume any time to continue from where it left off',
+        processedThisSession: scrapingQueue.processedThisSession,
+        remaining: stats.pending ?? 0,
     });
 });
 
-// GET /api/scrape/queue/status - Get queue status
-router.get('/queue/status', requireSuperAdmin, (req, res) => {
+// GET /api/scrape/queue/status - Queue status (DB counts + in-memory session info)
+router.get('/queue/status', requireSuperAdmin, async (req, res) => {
+    const stats = await dataStore.queueStats().catch(() => ({ pending: 0, processing: 0, done: 0, failed: 0, total: 0 }));
     res.json({
         success: true,
         processing: scrapingQueue.processing,
         current: scrapingQueue.current,
-        processed: scrapingQueue.processed,
-        failed: scrapingQueue.failed,
-        remaining: scrapingQueue.urls.length,
-        total: scrapingQueue.total,
+        // DB-based totals (accurate, survive restarts)
+        remaining: stats.pending + (stats.processing || 0),
+        processed: stats.done,
+        failed: stats.failed,
+        total: stats.total,
+        // Session info
+        processedThisSession: scrapingQueue.processedThisSession,
+        failedThisSession: scrapingQueue.failedThisSession,
         startedAt: scrapingQueue.startedAt,
-        errors: scrapingQueue.errors.slice(-10), // Last 10 errors
+        errors: scrapingQueue.errors.slice(-10),
     });
 });
 
-// DELETE /api/scrape/queue - Clear the queue
-router.delete('/queue', requireSuperAdmin, (req, res) => {
-    scrapingQueue = {
-        urls: [],
-        processing: false,
-        current: null,
-        processed: 0,
-        failed: 0,
-        total: 0,
-        startedAt: null,
-        errors: [],
-    };
+// POST /api/scrape/queue/retry-failed - Move all failed entries back to pending
+router.post('/queue/retry-failed', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const count = await dataStore.queueRetryFailed();
+        console.log(`♻️ Retrying ${count} failed URLs`);
+        res.json({ success: true, retried: count });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
+    }
+});
 
-    console.log('🗑️ Queue cleared');
-    res.json({ success: true, message: 'Queue cleared' });
+// DELETE /api/scrape/queue - Clear queue (all or by status)
+router.delete('/queue', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { status } = req.query; // ?status=failed | ?status=done | (empty = all)
+        if (scrapingQueue.processing && (!status || status === 'pending')) {
+            return res.json({ success: false, message: 'Stop the queue before clearing pending items' });
+        }
+        const deleted = await dataStore.queueClear(status || null);
+        console.log(`🗑️ Queue cleared (${status || 'all'}): ${deleted} rows`);
+        res.json({ success: true, deleted, message: `Cleared ${deleted} queue entries` });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
+    }
 });
 
 // Background queue processor
 async function processQueue() {
     let consecutiveRateLimits = 0;
     const MAX_RATE_LIMIT_RETRIES = 3;
-    const RATE_LIMIT_PAUSE_MS = 120000; // 2 minutes pause on rate limit
+    const RATE_LIMIT_PAUSE_MS = 120000; // 2 min pause on rate limit
 
-    while (scrapingQueue.processing && scrapingQueue.urls.length > 0) {
-        const url = scrapingQueue.urls.shift();
+    while (scrapingQueue.processing) {
+        // ── Dequeue next pending URL from DB ──────────────────────────────────
+        const url = await dataStore.queueDequeue().catch(() => null);
+
+        // No more pending URLs → done
+        if (!url) break;
+
         scrapingQueue.current = url;
 
         try {
-            console.log(`🔄 Processing: ${url}`);
+            // ── Validate: skip if already scraped & saved ─────────────────────
+            const alreadyExists = await dataStore.existsBySourceUrl(url).catch(() => false);
+            if (alreadyExists) {
+                console.log(`⏭️ Already in DB, skipping: ${url}`);
+                await dataStore.queueMark(url, 'done');
+                scrapingQueue.processedThisSession++;
+                consecutiveRateLimits = 0;
+                continue; // No delay needed for skip
+            }
+
+            // ── Scrape ────────────────────────────────────────────────────────
+            console.log(`🔄 Scraping: ${url}`);
             const perfume = await scrapePerfume(url);
 
             if (perfume) {
                 await dataStore.add(perfume);
+                await dataStore.queueMark(url, 'done');
                 console.log(`✅ Saved: ${perfume.name}`);
+            } else {
+                // scrapePerfume returned null/undefined (no data)
+                await dataStore.queueMark(url, 'failed', 'No data returned by scraper');
+                scrapingQueue.failedThisSession++;
+                scrapingQueue.errors.push({ url, error: 'No data returned', time: new Date().toISOString() });
             }
 
-            scrapingQueue.processed++;
-            consecutiveRateLimits = 0; // Reset on success
+            scrapingQueue.processedThisSession++;
+            consecutiveRateLimits = 0;
         } catch (error) {
-            const errorMessage = error.message || '';
-            console.error(`❌ Failed: ${url} - ${errorMessage}`);
+            const msg = error.message || '';
+            console.error(`❌ Failed: ${url} — ${msg}`);
 
-            // Check if it's a rate limit error
-            if (
-                errorMessage.includes('RATE_LIMITED') ||
-                errorMessage.includes('Too Many Requests')
-            ) {
+            // Rate limit → put back as pending and wait
+            if (msg.includes('RATE_LIMITED') || msg.includes('Too Many Requests')) {
                 consecutiveRateLimits++;
-                console.warn(
-                    `⚠️ Rate limit detected (${consecutiveRateLimits}/${MAX_RATE_LIMIT_RETRIES})`
-                );
-
-                // Put the URL back at the front of the queue for retry
-                scrapingQueue.urls.unshift(url);
+                await dataStore.queueMark(url, 'pending').catch(() => {});
+                console.warn(`⚠️ Rate limit (${consecutiveRateLimits}/${MAX_RATE_LIMIT_RETRIES})`);
 
                 if (consecutiveRateLimits >= MAX_RATE_LIMIT_RETRIES) {
-                    // Auto-resume: wait 5 minutes then keep going instead of stopping
-                    const longPause = 5 * 60 * 1000; // 5 min
-                    console.warn(
-                        `⚠️ ${MAX_RATE_LIMIT_RETRIES} rate limits consecutivos. Pausa larga de ${longPause / 60000} min, luego reanuda automáticamente.`
-                    );
-                    scrapingQueue.errors.push({
-                        url,
-                        error: `Rate limit múltiple: pausa de ${longPause / 60000} min y reanuda automáticamente.`,
-                        time: new Date().toISOString(),
-                    });
-                    consecutiveRateLimits = 0; // Reset counter
-                    await new Promise((resolve) => setTimeout(resolve, longPause));
-                    continue; // Resume automatically
+                    const longPause = 5 * 60 * 1000;
+                    console.warn(`⚠️ Multiple rate limits. Pausing ${longPause / 60000} min then resuming…`);
+                    scrapingQueue.errors.push({ url, error: `Rate limit × ${MAX_RATE_LIMIT_RETRIES}: paused ${longPause / 60000} min`, time: new Date().toISOString() });
+                    consecutiveRateLimits = 0;
+                    await new Promise(r => setTimeout(r, longPause));
+                } else {
+                    await new Promise(r => setTimeout(r, RATE_LIMIT_PAUSE_MS));
                 }
-
-                // Short pause before retry
-                console.log(
-                    `⏸️ Pausando ${RATE_LIMIT_PAUSE_MS / 1000}s por rate limit (intento ${consecutiveRateLimits}/${MAX_RATE_LIMIT_RETRIES})...`
-                );
-                await new Promise((resolve) =>
-                    setTimeout(resolve, RATE_LIMIT_PAUSE_MS)
-                );
-                continue;
+                continue; // Retry from DB (URL is pending again)
             }
 
-            // For invalid data errors, just skip and continue
-            if (errorMessage.includes('INVALID_DATA')) {
-                console.warn(`⏭️ Skipping invalid data: ${url}`);
-                scrapingQueue.failed++;
-                scrapingQueue.errors.push({
-                    url,
-                    error: errorMessage,
-                    time: new Date().toISOString(),
-                });
+            // Invalid data → mark failed, skip
+            if (msg.includes('INVALID_DATA')) {
+                console.warn(`⏭️ Invalid data: ${url}`);
+                await dataStore.queueMark(url, 'failed', msg);
+                scrapingQueue.failedThisSession++;
+                scrapingQueue.errors.push({ url, error: msg, time: new Date().toISOString() });
                 consecutiveRateLimits = 0;
                 continue;
             }
 
-            // For other errors, log and continue
-            scrapingQueue.failed++;
-            scrapingQueue.errors.push({
-                url,
-                error: errorMessage,
-                time: new Date().toISOString(),
-            });
+            // Other errors → mark failed, keep going
+            await dataStore.queueMark(url, 'failed', msg);
+            scrapingQueue.failedThisSession++;
+            scrapingQueue.errors.push({ url, error: msg, time: new Date().toISOString() });
+            if (scrapingQueue.errors.length > 20) scrapingQueue.errors.shift();
         }
 
-        // Delay between requests (15 seconds to be safer against rate limits)
-        await new Promise((resolve) => setTimeout(resolve, 15000));
+        // Respectful delay between requests
+        await new Promise(r => setTimeout(r, 15000));
     }
 
     scrapingQueue.processing = false;
     scrapingQueue.current = null;
-    console.log(
-        `✅ Queue processing complete. Processed: ${scrapingQueue.processed}, Failed: ${scrapingQueue.failed}`
-    );
+    console.log(`✅ Queue session done. Processed: ${scrapingQueue.processedThisSession}, Failed: ${scrapingQueue.failedThisSession}`);
 }
 
 // GET /api/scrape/incomplete/by-brand - Incomplete perfumes grouped by brand
@@ -810,21 +823,14 @@ router.post('/rescrape/brand', requireSuperAdmin, async (req, res, next) => {
             return res.json({ success: true, processed: results.length, failed: errors.length, results, errors });
         }
 
-        // Queue mode
-        const urls = brandPerfumes.map(p => p.sourceUrl);
-        scrapingQueue.urls.push(...urls);
-        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+        // Queue mode — re-scrape clears done/failed status for these URLs so they run again
+        const urls = brandPerfumes.map(p => p.sourceUrl).filter(Boolean);
+        // For re-scrape, reset existing queue entries to pending; enqueue new ones
+        await dataStore.queueClear('done').catch(() => {});
+        const added = await enqueueUrls(urls, true);
 
-        let autoStarted = false;
-        if (!scrapingQueue.processing) {
-            scrapingQueue.processing = true;
-            scrapingQueue.startedAt = new Date().toISOString();
-            scrapingQueue.errors = [];
-            processQueue();
-            autoStarted = true;
-        }
-
-        res.json({ success: true, added: urls.length, queueSize: scrapingQueue.urls.length, autoStarted });
+        const stats = await dataStore.queueStats().catch(() => ({}));
+        res.json({ success: true, added, queueSize: stats.pending ?? added, autoStarted: true });
     } catch (error) {
         next(new ApiError(error.message, 500));
     }
@@ -909,25 +915,16 @@ router.post('/rescrape/queue', requireSuperAdmin, async (req, res, next) => {
         const { limit = 500 } = req.body;
         const perfumes = await dataStore.getIncomplete({ limit });
 
+        const stats0 = await dataStore.queueStats().catch(() => ({}));
         if (perfumes.length === 0) {
-            return res.json({ success: true, added: 0, queueSize: scrapingQueue.urls.length, message: 'No incomplete perfumes found' });
+            return res.json({ success: true, added: 0, queueSize: stats0.pending ?? 0, message: 'No incomplete perfumes found' });
         }
 
         const urlsToAdd = perfumes.filter((p) => p.sourceUrl).map((p) => p.sourceUrl);
-        scrapingQueue.urls.push(...urlsToAdd);
-        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+        const added = await enqueueUrls(urlsToAdd, true);
 
-        // Auto-start the queue if not already running
-        let autoStarted = false;
-        if (!scrapingQueue.processing && urlsToAdd.length > 0) {
-            scrapingQueue.processing = true;
-            scrapingQueue.startedAt = new Date().toISOString();
-            scrapingQueue.errors = [];
-            processQueue();
-            autoStarted = true;
-        }
-
-        res.json({ success: true, added: urlsToAdd.length, queueSize: scrapingQueue.urls.length, autoStarted });
+        const stats = await dataStore.queueStats().catch(() => ({}));
+        res.json({ success: true, added, queueSize: stats.pending ?? added, autoStarted: true });
     } catch (error) {
         next(new ApiError(error.message, 500));
     }
@@ -941,14 +938,13 @@ router.post('/reset', requireSuperAdmin, async (req, res, next) => {
             return next(new ApiError('Send { confirm: "CONFIRM_RESET" } to proceed', 400));
         }
 
-        // Stop scraping queue
+        // Stop scraping queue and clear DB queue
         scrapingQueue.processing = false;
-        scrapingQueue.urls = [];
-        scrapingQueue.processed = 0;
-        scrapingQueue.failed = 0;
-        scrapingQueue.total = 0;
         scrapingQueue.current = null;
+        scrapingQueue.processedThisSession = 0;
+        scrapingQueue.failedThisSession = 0;
         scrapingQueue.errors = [];
+        await dataStore.queueClear().catch(() => {});
 
         const [perfumesResult, brandsResult] = await Promise.all([
             dataStore.clearPerfumes(),
@@ -1062,18 +1058,10 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
             const uniqueUrls = [...new Set(allFound)];
             const newUrls = uniqueUrls.filter(u => !existingUrls.has(u));
 
-            // ── 3. Add new URLs to queue ──
-            scrapingQueue.urls.push(...newUrls);
-            scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+            // ── 3. Add new URLs to persistent DB queue ──
+            const added = await enqueueUrls(newUrls, autoStart);
 
-            if (autoStart && !scrapingQueue.processing && newUrls.length > 0) {
-                scrapingQueue.processing = true;
-                scrapingQueue.startedAt = new Date().toISOString();
-                scrapingQueue.errors = [];
-                processQueue();
-            }
-
-            console.log(`✅ [bg] Full catalog done: ${uniqueUrls.length} unique found, ${newUrls.length} new queued, ${uniqueUrls.length - newUrls.length} already existed`);
+            console.log(`✅ [bg] Full catalog done: ${uniqueUrls.length} unique found, ${added} new queued, ${uniqueUrls.length - added} already existed`);
         } catch (err) {
             console.error('[bg] ❌ Full catalog discovery error:', err.message);
         } finally {
