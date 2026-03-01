@@ -975,17 +975,27 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, next) => {
     try {
         const { autoStart = true } = req.body;
 
-        console.log('🌍 Full catalog import: reading Fragrantica sitemaps...');
+        console.log('🌍 Full catalog import: reading Fragrantica sitemaps via Puppeteer...');
 
-        const BOT_UA = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+        const puppeteer = (await import('puppeteer')).default;
+        const browser = await puppeteer.launch({
+            headless: 'new',
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        });
+
+        const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
         const fetchXml = async (url) => {
-            const resp = await fetch(url, {
-                headers: { 'User-Agent': BOT_UA, Accept: 'text/xml,application/xml,*/*' },
-                signal: AbortSignal.timeout(30000),
-            });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            return resp.text();
+            const page = await browser.newPage();
+            try {
+                await page.setUserAgent(BROWSER_UA);
+                await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+                await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+                return await page.content();
+            } finally {
+                await page.close();
+            }
         };
 
         // ── 1. Discover sub-sitemap files from the index ──
@@ -996,7 +1006,7 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, next) => {
             sitemapUrls = [...new Set(matches)];
             console.log(`  → Sitemap index: found ${sitemapUrls.length} perfume sub-sitemaps`);
         } catch (err) {
-            console.warn(`  ⚠️ Could not fetch sitemap.xml directly: ${err.message}`);
+            console.warn(`  ⚠️ Could not fetch sitemap.xml: ${err.message}`);
         }
 
         // Fallback: probe known numbered sitemap paths (Fragrantica uses sitemap_perfumes_1.xml … N.xml)
@@ -1028,6 +1038,8 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, next) => {
                 console.warn(`  ⚠️ Skipping ${sitemapUrl}: ${err.message}`);
             }
         }
+
+        await browser.close();
 
         if (allFound.length === 0) {
             return next(new ApiError(
