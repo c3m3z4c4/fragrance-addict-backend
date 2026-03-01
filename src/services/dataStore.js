@@ -159,10 +159,22 @@ export const initDatabase = async () => {
         ALTER TABLE perfumes ADD COLUMN perfumer_image_url TEXT;
       END IF;
       -- Add unique constraint on source_url to prevent duplicates from same URL
+      -- First, deduplicate existing rows with the same source_url (keep highest rated)
       IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'perfumes_source_url_unique' AND conrelid = 'perfumes'::regclass
       ) THEN
+        DELETE FROM perfumes WHERE id IN (
+          SELECT id FROM (
+            SELECT id, ROW_NUMBER() OVER (
+              PARTITION BY source_url
+              ORDER BY COALESCE(rating, 0) DESC, created_at ASC
+            ) AS rn
+            FROM perfumes
+            WHERE source_url IS NOT NULL
+          ) ranked
+          WHERE rn > 1
+        );
         ALTER TABLE perfumes ADD CONSTRAINT perfumes_source_url_unique UNIQUE (source_url);
       END IF;
     END $$;
