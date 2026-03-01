@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireSuperAdmin } from '../middleware/auth.js';
 import { dataStore } from '../services/dataStore.js';
 import { ApiError } from '../middleware/errorHandler.js';
 
@@ -8,13 +8,16 @@ const router = Router();
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 const ALLOWED_MODELS = [
-    'gemini-2.5-flash',
-    'gemini-2.5-pro',
     'gemini-2.0-flash',
     'gemini-2.0-flash-lite',
-    'gemini-flash-latest',
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
+    'gemini-2.5-flash',
 ];
-const DEFAULT_MODEL = 'gemini-2.5-flash';
+const DEFAULT_MODEL = 'gemini-2.0-flash';
+
+/** Runtime-configurable default model (set by admin, resets on restart) */
+let configuredDefaultModel = process.env.AI_DEFAULT_MODEL || DEFAULT_MODEL;
 
 /** Maps profile gender to DB gender value */
 const GENDER_MAP = { man: 'masculine', woman: 'feminine', unisex: 'unisex' };
@@ -45,7 +48,28 @@ function formatCatalogEntry(p) {
  * GET /api/ai/models
  */
 router.get('/models', requireAuth, (_req, res) => {
-    res.json({ models: ALLOWED_MODELS, default: DEFAULT_MODEL });
+    res.json({ models: ALLOWED_MODELS, default: configuredDefaultModel });
+});
+
+/**
+ * GET /api/ai/config  — Admin only: get current AI configuration
+ */
+router.get('/config', requireSuperAdmin, (_req, res) => {
+    res.json({ model: configuredDefaultModel, models: ALLOWED_MODELS });
+});
+
+/**
+ * PATCH /api/ai/config  — Admin only: set default model
+ * Body: { model: string }
+ */
+router.patch('/config', requireSuperAdmin, (req, res, next) => {
+    const { model } = req.body;
+    if (!model || !ALLOWED_MODELS.includes(model)) {
+        return next(new ApiError(`Invalid model. Allowed: ${ALLOWED_MODELS.join(', ')}`, 400));
+    }
+    configuredDefaultModel = model;
+    console.log(`🤖 AI default model updated to: ${model}`);
+    res.json({ success: true, model: configuredDefaultModel });
 });
 
 /**
@@ -67,7 +91,7 @@ router.post('/recommendations', requireAuth, async (req, res, next) => {
         const requestedModel = req.body?.model;
         const model = (requestedModel && ALLOWED_MODELS.includes(requestedModel))
             ? requestedModel
-            : DEFAULT_MODEL;
+            : configuredDefaultModel;
 
         const profile = req.body?.profile || null;
 
