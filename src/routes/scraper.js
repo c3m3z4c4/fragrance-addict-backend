@@ -1085,4 +1085,25 @@ router.delete('/cache', requireSuperAdmin, (req, res) => {
     res.json({ success: true, message: 'Caché limpiado' });
 });
 
+// GET /api/scrape/duplicates - Find duplicate perfumes (same name+brand)
+router.get('/duplicates', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const duplicates = await dataStore.findDuplicates();
+        res.json({ success: true, data: duplicates, count: duplicates.length });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// DELETE /api/scrape/duplicates - Delete duplicates keeping highest-rated
+router.delete('/duplicates', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const result = await dataStore.deleteDuplicates();
+        const count = result?.deleted ?? 0;
+        res.json({ success: true, deleted: count, message: `Deleted ${count} duplicate perfume(s)` });
+    } catch (err) {
+        next(err);
+    }
+});
+
 export default router;

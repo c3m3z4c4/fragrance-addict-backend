@@ -158,6 +158,13 @@ export const initDatabase = async () => {
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='perfumes' AND column_name='perfumer_image_url') THEN
         ALTER TABLE perfumes ADD COLUMN perfumer_image_url TEXT;
       END IF;
+      -- Add unique constraint on source_url to prevent duplicates from same URL
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'perfumes_source_url_unique' AND conrelid = 'perfumes'::regclass
+      ) THEN
+        ALTER TABLE perfumes ADD CONSTRAINT perfumes_source_url_unique UNIQUE (source_url);
+      END IF;
     END $$;
 
     CREATE TABLE IF NOT EXISTS api_keys (
@@ -417,6 +424,67 @@ export const dataStore = {
         };
     },
 
+    // Find duplicate perfumes (same name + brand, different ids)
+    findDuplicates: async () => {
+        if (!isDatabaseConnected) return [];
+        const result = await pool.query(`
+            SELECT
+                LOWER(TRIM(name)) AS norm_name,
+                LOWER(TRIM(brand)) AS norm_brand,
+                COUNT(*) AS count,
+                ARRAY_AGG(id ORDER BY created_at ASC) AS ids,
+                ARRAY_AGG(name ORDER BY created_at ASC) AS names,
+                ARRAY_AGG(brand ORDER BY created_at ASC) AS brands,
+                ARRAY_AGG(source_url ORDER BY created_at ASC) AS urls,
+                ARRAY_AGG(created_at ORDER BY created_at ASC) AS created_ats,
+                ARRAY_AGG(COALESCE(rating, 0) ORDER BY created_at ASC) AS ratings
+            FROM perfumes
+            GROUP BY LOWER(TRIM(name)), LOWER(TRIM(brand))
+            HAVING COUNT(*) > 1
+            ORDER BY COUNT(*) DESC
+        `);
+        return result.rows.map(row => ({
+            name: row.names[0],
+            brand: row.brands[0],
+            count: parseInt(row.count),
+            duplicates: row.ids.map((id, i) => ({
+                id,
+                name: row.names[i],
+                brand: row.brands[i],
+                sourceUrl: row.urls[i],
+                createdAt: row.created_ats[i],
+                rating: row.ratings[i],
+            })),
+        }));
+    },
+
+    // Delete duplicate perfumes keeping the first-created one (or highest rated if specified)
+    deleteDuplicates: async () => {
+        if (!isDatabaseConnected) return { deleted: 0, groups: 0 };
+        // For each name+brand group with duplicates, keep the earliest created entry,
+        // then delete all others. Returns counts.
+        const result = await pool.query(`
+            WITH ranked AS (
+                SELECT id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY LOWER(TRIM(name)), LOWER(TRIM(brand))
+                        ORDER BY COALESCE(rating, 0) DESC, created_at ASC
+                    ) AS rn
+                FROM perfumes
+            ),
+            to_delete AS (
+                SELECT id FROM ranked WHERE rn > 1
+            )
+            DELETE FROM perfumes WHERE id IN (SELECT id FROM to_delete)
+            RETURNING id
+        `);
+        const groupResult = await pool.query(`
+            SELECT COUNT(DISTINCT LOWER(TRIM(name)) || '|' || LOWER(TRIM(brand))) AS groups
+            FROM perfumes
+        `);
+        return { deleted: result.rowCount, groups: parseInt(groupResult.rows[0]?.groups || 0) };
+    },
+
     // Get all source URLs (for duplicate checking)
     getAllSourceUrls: async () => {
         if (!isDatabaseConnected) {
@@ -504,6 +572,24 @@ export const dataStore = {
         const query = `
       INSERT INTO perfumes (id, name, brand, year, perfumer, perfumer_image_url, gender, concentration, notes, accords, description, image_url, rating, sillage, longevity, projection, similar_perfumes, season_usage, source_url, scraped_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+      ON CONFLICT (source_url) DO UPDATE SET
+        name = EXCLUDED.name,
+        brand = EXCLUDED.brand,
+        year = COALESCE(EXCLUDED.year, perfumes.year),
+        perfumer = COALESCE(EXCLUDED.perfumer, perfumes.perfumer),
+        perfumer_image_url = COALESCE(EXCLUDED.perfumer_image_url, perfumes.perfumer_image_url),
+        gender = COALESCE(EXCLUDED.gender, perfumes.gender),
+        concentration = COALESCE(EXCLUDED.concentration, perfumes.concentration),
+        notes = EXCLUDED.notes,
+        accords = EXCLUDED.accords,
+        description = COALESCE(EXCLUDED.description, perfumes.description),
+        image_url = COALESCE(EXCLUDED.image_url, perfumes.image_url),
+        rating = COALESCE(EXCLUDED.rating, perfumes.rating),
+        sillage = COALESCE(EXCLUDED.sillage, perfumes.sillage),
+        longevity = COALESCE(EXCLUDED.longevity, perfumes.longevity),
+        season_usage = COALESCE(EXCLUDED.season_usage, perfumes.season_usage),
+        scraped_at = EXCLUDED.scraped_at,
+        updated_at = NOW()
       RETURNING *
     `;
         const values = [

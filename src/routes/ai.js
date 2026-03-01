@@ -84,10 +84,6 @@ router.post('/recommendations', requireAuth, async (req, res, next) => {
             return next(new ApiError('Gemini API key not configured on this server', 503));
         }
 
-        if (!isGmailUser(req.user)) {
-            return next(new ApiError('Gemini recommendations are available for Google/Gmail users only', 403));
-        }
-
         const requestedModel = req.body?.model;
         const model = (requestedModel && ALLOWED_MODELS.includes(requestedModel))
             ? requestedModel
