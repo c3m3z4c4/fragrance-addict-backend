@@ -970,6 +970,109 @@ router.post('/reset', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
+// POST /api/scrape/catalog/full - Discover & queue ALL perfumes from Fragrantica sitemaps
+router.post('/catalog/full', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { autoStart = true } = req.body;
+
+        console.log('🌍 Full catalog import: reading Fragrantica sitemaps...');
+
+        const BOT_UA = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+
+        const fetchXml = async (url) => {
+            const resp = await fetch(url, {
+                headers: { 'User-Agent': BOT_UA, Accept: 'text/xml,application/xml,*/*' },
+                signal: AbortSignal.timeout(30000),
+            });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            return resp.text();
+        };
+
+        // ── 1. Discover sub-sitemap files from the index ──
+        let sitemapUrls = [];
+        try {
+            const indexXml = await fetchXml('https://www.fragrantica.com/sitemap.xml');
+            const matches = indexXml.match(/https?:\/\/[^\s<>"]*sitemap_perfumes_\d+\.xml/g) || [];
+            sitemapUrls = [...new Set(matches)];
+            console.log(`  → Sitemap index: found ${sitemapUrls.length} perfume sub-sitemaps`);
+        } catch (err) {
+            console.warn(`  ⚠️ Could not fetch sitemap.xml directly: ${err.message}`);
+        }
+
+        // Fallback: probe known numbered sitemap paths (Fragrantica uses sitemap_perfumes_1.xml … N.xml)
+        if (sitemapUrls.length === 0) {
+            for (let i = 1; i <= 6; i++) {
+                sitemapUrls.push(`https://www.fragrantica.com/sitemap_perfumes_${i}.xml`);
+            }
+            console.log(`  → Fallback: probing ${sitemapUrls.length} candidate sub-sitemap URLs`);
+        }
+
+        // ── 2. Extract perfume URLs from each sub-sitemap ──
+        const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
+        const allFound = [];
+        let foundSitemaps = 0;
+
+        for (const sitemapUrl of sitemapUrls) {
+            try {
+                const xml = await fetchXml(sitemapUrl);
+                const urls = (xml.match(/https?:\/\/[^\s<>"]*\/perfume\/[^<\s"]+\.html/g) || [])
+                    .filter(u => /\/perfume\/[^/]+\/[^/]+\.html$/.test(u));
+                if (urls.length > 0) {
+                    allFound.push(...urls);
+                    foundSitemaps++;
+                    console.log(`  → ${sitemapUrl}: ${urls.length} URLs`);
+                } else {
+                    console.log(`  → ${sitemapUrl}: 0 URLs (empty or blocked)`);
+                }
+            } catch (err) {
+                console.warn(`  ⚠️ Skipping ${sitemapUrl}: ${err.message}`);
+            }
+        }
+
+        if (allFound.length === 0) {
+            return next(new ApiError(
+                'Could not retrieve perfume URLs from Fragrantica sitemaps. The site may be temporarily blocking access — try again in a few minutes.',
+                502
+            ));
+        }
+
+        const uniqueUrls = [...new Set(allFound)];
+        const newUrls = uniqueUrls.filter(u => !existingUrls.has(u));
+
+        // ── 3. Add new URLs to queue ──
+        scrapingQueue.urls.push(...newUrls);
+        scrapingQueue.total = scrapingQueue.urls.length + scrapingQueue.processed;
+
+        let autoStarted = false;
+        if (autoStart && !scrapingQueue.processing && newUrls.length > 0) {
+            scrapingQueue.processing = true;
+            scrapingQueue.startedAt = new Date().toISOString();
+            scrapingQueue.errors = [];
+            processQueue();
+            autoStarted = true;
+        }
+
+        const estimatedHours = Math.round((newUrls.length * 15) / 3600);
+        const estimatedDays = Math.round((newUrls.length * 15) / 86400);
+
+        console.log(`✅ Full catalog: found ${uniqueUrls.length} unique, ${newUrls.length} new queued, ${uniqueUrls.length - newUrls.length} already exist`);
+
+        res.json({
+            success: true,
+            sitemapsDiscovered: foundSitemaps,
+            totalFound: uniqueUrls.length,
+            newQueued: newUrls.length,
+            alreadyExist: uniqueUrls.length - newUrls.length,
+            queueSize: scrapingQueue.urls.length,
+            estimatedHours,
+            estimatedDays,
+            autoStarted,
+        });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
 // GET /api/scrape/cache/stats - Estadísticas del caché
 router.get('/cache/stats', requireSuperAdmin, (req, res) => {
     const stats = cacheService.stats();
