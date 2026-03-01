@@ -155,6 +155,9 @@ export const initDatabase = async () => {
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='perfumes' AND column_name='season_usage') THEN
         ALTER TABLE perfumes ADD COLUMN season_usage JSONB DEFAULT NULL;
       END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='perfumes' AND column_name='perfumer_image_url') THEN
+        ALTER TABLE perfumes ADD COLUMN perfumer_image_url TEXT;
+      END IF;
     END $$;
 
     CREATE TABLE IF NOT EXISTS api_keys (
@@ -286,6 +289,14 @@ export const getConnectionError = () => connectionError;
 // In-memory fallback storage
 let memoryStore = [];
 
+// Normalize accords: DB may store string[] or legacy object[{name,...}]; always return string[]
+const normalizeAccords = (raw) => {
+    if (!Array.isArray(raw)) return [];
+    return raw
+        .map(a => (typeof a === 'string' ? a : (a && a.name ? String(a.name) : null)))
+        .filter(Boolean);
+};
+
 // Convertir snake_case a camelCase
 const toCamelCase = (row) => {
     if (!row) return null;
@@ -295,10 +306,11 @@ const toCamelCase = (row) => {
         brand: row.brand,
         year: row.year,
         perfumer: row.perfumer,
+        perfumerImageUrl: row.perfumer_image_url || null,
         gender: row.gender,
         concentration: row.concentration,
         notes: row.notes,
-        accords: row.accords,
+        accords: normalizeAccords(row.accords),
         description: row.description,
         imageUrl: row.image_url,
         rating: row.rating ? parseFloat(row.rating) : null,
@@ -306,6 +318,7 @@ const toCamelCase = (row) => {
         longevity: row.longevity,
         projection: row.projection,
         similarPerfumes: row.similar_perfumes || [],
+        seasonUsage: row.season_usage || null,
         sourceUrl: row.source_url,
         scrapedAt: row.scraped_at,
         createdAt: row.created_at,
@@ -489,8 +502,8 @@ export const dataStore = {
         }
 
         const query = `
-      INSERT INTO perfumes (id, name, brand, year, perfumer, gender, concentration, notes, accords, description, image_url, rating, sillage, longevity, projection, similar_perfumes, season_usage, source_url, scraped_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+      INSERT INTO perfumes (id, name, brand, year, perfumer, perfumer_image_url, gender, concentration, notes, accords, description, image_url, rating, sillage, longevity, projection, similar_perfumes, season_usage, source_url, scraped_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
       RETURNING *
     `;
         const values = [
@@ -499,6 +512,7 @@ export const dataStore = {
             perfume.brand,
             perfume.year || null,
             perfume.perfumer || null,
+            perfume.perfumerImageUrl || null,
             perfume.gender || null,
             perfume.concentration || null,
             JSON.stringify(perfume.notes || { top: [], heart: [], base: [] }),
@@ -541,6 +555,7 @@ export const dataStore = {
             brand: 'brand',
             year: 'year',
             perfumer: 'perfumer',
+            perfumerImageUrl: 'perfumer_image_url',
             gender: 'gender',
             concentration: 'concentration',
             notes: 'notes',

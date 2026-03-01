@@ -91,12 +91,14 @@ export const scrapePerfume = async (url) => {
         }
 
         // Extraer datos usando selectores de Fragrantica
+        const perfumerData = extractPerfumerData($);
         const perfume = {
             id: uuidv4(),
             name: extractName($),
             brand: extractBrand($),
             year: extractYear($),
-            perfumer: extractPerfumer($),
+            perfumer: perfumerData.name,
+            perfumerImageUrl: perfumerData.imageUrl,
             gender: extractGender($),
             concentration: extractConcentration($),
             notes: extractNotes($),
@@ -229,31 +231,38 @@ function extractYear($) {
     return null;
 }
 
-// Extraer perfumista/nariz
-function extractPerfumer($) {
-    // En Fragrantica, los perfumistas aparecen en enlaces específicos
-    const perfumerLink = $('a[href*="/noses/"]');
-    if (perfumerLink.length) {
+// Extraer perfumista/nariz — returns { name: string|null, imageUrl: string|null }
+function extractPerfumerData($) {
+    const perfumerLinks = $('a[href*="/noses/"]');
+    if (perfumerLinks.length) {
         const perfumers = [];
-        perfumerLink.each((_, el) => {
-            const name = $(el).text().trim().replace(/^perfumers?[,:]?\s*/i, '');
-            if (name && !perfumers.includes(name)) {
+        let firstImageUrl = null;
+        perfumerLinks.each((_, el) => {
+            const $el = $(el);
+            // Image may be inside the link or adjacent
+            const img = $el.find('img').first();
+            const imgSrc = img.attr('src') || img.attr('data-src') || null;
+            const imgUrl = imgSrc
+                ? (imgSrc.startsWith('//') ? `https:${imgSrc}` : imgSrc)
+                : null;
+            const name = $el.clone().children('img').remove().end()
+                .text().trim().replace(/^perfumers?[,:]?\s*/i, '');
+            if (name && !perfumers.find(p => p === name)) {
                 perfumers.push(name);
+                if (!firstImageUrl && imgUrl) firstImageUrl = imgUrl;
             }
         });
-        return perfumers.length > 0 ? perfumers.join(', ') : null;
+        if (perfumers.length > 0) {
+            return { name: perfumers.join(', '), imageUrl: firstImageUrl };
+        }
     }
 
     // Fallback: buscar texto con "created by" o "nose"
     const text = $('body').text();
-    const creatorMatch = text.match(
-        /(?:created\s+by|nose[s]?:?)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/i
-    );
-    if (creatorMatch) {
-        return creatorMatch[1].trim();
-    }
+    const match = text.match(/(?:created\s+by|nose[s]?:?)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/i);
+    if (match) return { name: match[1].trim(), imageUrl: null };
 
-    return null;
+    return { name: null, imageUrl: null };
 }
 
 // Extraer género
@@ -452,45 +461,64 @@ function extractNotes($) {
     return notes;
 }
 
-// Extraer acordes principales
+// Extraer acordes principales — returns string[] ordered by prominence
 function extractAccords($) {
-    const accords = [];
+    const clean = (text) =>
+        text.replace(/\d[\d,.]*/g, '').replace(/votes?/gi, '').replace(/\s+/g, ' ').trim();
 
-    // Fragrantica muestra acordes en divs con clase accord-bar o similar
-    $('.accord-bar, [class*="accord"]').each((_, el) => {
+    // ── Strategy 1: .accord-bar elements with an inline width style ──────────
+    const withWidth = [];
+    const withoutWidth = [];
+    $('.accord-bar, [class*="accord-bar"]').each((_, el) => {
         const $el = $(el);
-        const accordName = $el.text().trim();
+        // Extract name: prefer direct span child, otherwise element text minus numbers
+        const spanName = $el.children('span').first().text().trim();
+        const rawName = spanName || clean($el.clone().children('[class*="vote"],[class*="count"],[class*="num"]').remove().end().text());
+        if (!rawName || rawName.length < 2 || rawName.length > 60) return;
         const style = $el.attr('style') || '';
-
-        // Extraer porcentaje del width del estilo
         const widthMatch = style.match(/width:\s*([\d.]+)%/);
-        const percentage = widthMatch ? parseFloat(widthMatch[1]) : 0;
-
-        // Extraer color de fondo
-        const bgMatch = style.match(
-            /background(?:-color)?:\s*(?:rgb\((\d+),\s*(\d+),\s*(\d+)\)|#([a-fA-F0-9]{6})|#([a-fA-F0-9]{3}))/
-        );
-        let color = null;
-        if (bgMatch) {
-            if (bgMatch[1]) {
-                color = `rgb(${bgMatch[1]}, ${bgMatch[2]}, ${bgMatch[3]})`;
-            } else if (bgMatch[4]) {
-                color = `#${bgMatch[4]}`;
-            } else if (bgMatch[5]) {
-                color = `#${bgMatch[5]}`;
-            }
+        if (widthMatch) {
+            withWidth.push({ name: rawName, pct: parseFloat(widthMatch[1]) });
+        } else {
+            withoutWidth.push(rawName);
         }
+    });
+    if (withWidth.length > 0) {
+        withWidth.sort((a, b) => b.pct - a.pct);
+        return [...new Set([...withWidth.map(a => a.name), ...withoutWidth])];
+    }
+    if (withoutWidth.length > 0) return [...new Set(withoutWidth)];
 
-        if (accordName && accordName.length < 50 && !accordName.includes('%')) {
-            accords.push({
-                name: accordName,
-                percentage: Math.round(percentage),
-                color,
+    // ── Strategy 2: <a href="/accords/..."> links (most reliable) ────────────
+    const fromLinks = [];
+    $('a[href*="/accords/"]').each((_, el) => {
+        const name = $(el).text().trim();
+        if (name && name.length > 1 && name.length < 60) fromLinks.push(name);
+    });
+    if (fromLinks.length > 0) return [...new Set(fromLinks)];
+
+    // ── Strategy 3: "Main Accords" / "Acordes Principales" section header ────
+    const sectionAccords = [];
+    $('b, strong, h3, h4').each((_, el) => {
+        const txt = $(el).text().trim().toLowerCase();
+        if (txt.includes('accord') || txt.includes('acorde')) {
+            $(el).closest('div, section, .cell').find('a[href*="/accords/"]').each((__, a) => {
+                const name = $(a).text().trim();
+                if (name && name.length > 1 && name.length < 60) sectionAccords.push(name);
             });
         }
     });
+    if (sectionAccords.length > 0) return [...new Set(sectionAccords)];
 
-    return accords;
+    // ── Strategy 4: any element with class containing "accord" — text only ───
+    const genericAccords = [];
+    $('[class*="accord"]').each((_, el) => {
+        const $el = $(el);
+        if ($el.children('[class*="accord"]').length > 0) return; // skip containers
+        const name = clean($el.text());
+        if (name && name.length > 1 && name.length < 60) genericAccords.push(name);
+    });
+    return [...new Set(genericAccords)];
 }
 
 // Extraer descripción
@@ -617,7 +645,8 @@ function extractPerformanceMetric($, metric) {
             const key = labelMap[labelTxt];
             const count = parseInt(countTxt, 10);
             if (key && !isNaN(count) && count >= 0) {
-                votes[key] = (votes[key] || 0) + count;
+                // Use max (not sum) to avoid double-counting from nested container scans
+                votes[key] = Math.max(votes[key] || 0, count);
             }
         });
     };
