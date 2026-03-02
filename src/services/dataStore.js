@@ -252,11 +252,18 @@ export const initDatabase = async () => {
       status VARCHAR(20) DEFAULT 'pending',
       retry_count SMALLINT DEFAULT 0,
       error_msg TEXT,
+      force BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_scrape_queue_status ON scrape_queue(status);
     CREATE INDEX IF NOT EXISTS idx_scrape_queue_pending ON scrape_queue(created_at) WHERE status = 'pending';
+    -- Migration: add force column if table already exists without it
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='scrape_queue' AND column_name='force') THEN
+        ALTER TABLE scrape_queue ADD COLUMN force BOOLEAN DEFAULT FALSE;
+      END IF;
+    END $$;
   `;
 
     try {
@@ -524,17 +531,29 @@ export const dataStore = {
     // ── Scrape Queue (persistent) ──────────────────────────────────────────────
 
     // Add URLs to the queue (skip already queued/done)
-    queueEnqueue: async (urls) => {
+    queueEnqueue: async (urls, force = false) => {
         if (!isDatabaseConnected || !urls.length) return 0;
-        const values = urls.map((_, i) => `($${i + 1})`).join(', ');
-        const result = await pool.query(
-            `INSERT INTO scrape_queue (url) VALUES ${values} ON CONFLICT (url) DO NOTHING`,
-            urls
-        );
-        return result.rowCount;
+        if (force) {
+            // Re-scrape mode: reset existing entries to pending+force, add new ones
+            const values = urls.map((_, i) => `($${i + 1})`).join(', ');
+            const result = await pool.query(
+                `INSERT INTO scrape_queue (url, force) VALUES ${urls.map((_, i) => `($${i + 1}, TRUE)`).join(', ')}
+                 ON CONFLICT (url) DO UPDATE
+                   SET status = 'pending', force = TRUE, error_msg = NULL, retry_count = 0, updated_at = NOW()`,
+                urls
+            );
+            return result.rowCount;
+        } else {
+            const values = urls.map((_, i) => `($${i + 1})`).join(', ');
+            const result = await pool.query(
+                `INSERT INTO scrape_queue (url) VALUES ${values} ON CONFLICT (url) DO NOTHING`,
+                urls
+            );
+            return result.rowCount;
+        }
     },
 
-    // Atomically claim next pending URL → marks it 'processing', returns url or null
+    // Atomically claim next pending URL → marks it 'processing', returns {url, force} or null
     queueDequeue: async () => {
         if (!isDatabaseConnected) return null;
         const result = await pool.query(`
@@ -546,9 +565,10 @@ export const dataStore = {
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING url
+            RETURNING url, force
         `);
-        return result.rows[0]?.url || null;
+        if (!result.rows[0]) return null;
+        return { url: result.rows[0].url, force: result.rows[0].force ?? false };
     },
 
     // Mark a queued URL as done / failed

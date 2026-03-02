@@ -42,9 +42,10 @@ let scrapingQueue = {
     failed: 0,
 };
 
-/** Enqueue URLs into DB and optionally start processing. Returns count added. */
-async function enqueueUrls(urls, autoStart = false) {
-    const added = await dataStore.queueEnqueue(urls).catch(() => {
+/** Enqueue URLs into DB and optionally start processing. Returns count added.
+ *  force=true: re-scrape mode — bypasses existsBySourceUrl check, resets done/failed entries. */
+async function enqueueUrls(urls, autoStart = false, force = false) {
+    const added = await dataStore.queueEnqueue(urls, force).catch(() => {
         // DB unavailable — fall back to in-memory
         const newUrls = urls.filter(u => !scrapingQueue.urls.includes(u));
         scrapingQueue.urls.push(...newUrls);
@@ -681,26 +682,32 @@ async function processQueue() {
 
     while (scrapingQueue.processing) {
         // ── Dequeue next pending URL from DB ──────────────────────────────────
-        const url = await dataStore.queueDequeue().catch(() => null);
+        const item = await dataStore.queueDequeue().catch(() => null);
 
         // No more pending URLs → done
-        if (!url) break;
+        if (!item) break;
+
+        // Support both new {url, force} shape and legacy string fallback
+        const url = typeof item === 'string' ? item : item.url;
+        const force = typeof item === 'string' ? false : (item.force ?? false);
 
         scrapingQueue.current = url;
 
         try {
-            // ── Validate: skip if already scraped & saved ─────────────────────
-            const alreadyExists = await dataStore.existsBySourceUrl(url).catch(() => false);
-            if (alreadyExists) {
-                console.log(`⏭️ Already in DB, skipping: ${url}`);
-                await dataStore.queueMark(url, 'done');
-                scrapingQueue.processedThisSession++;
-                consecutiveRateLimits = 0;
-                continue; // No delay needed for skip
+            // ── Validate: skip if already scraped & saved (unless force re-scrape) ─
+            if (!force) {
+                const alreadyExists = await dataStore.existsBySourceUrl(url).catch(() => false);
+                if (alreadyExists) {
+                    console.log(`⏭️ Already in DB, skipping: ${url}`);
+                    await dataStore.queueMark(url, 'done');
+                    scrapingQueue.processedThisSession++;
+                    consecutiveRateLimits = 0;
+                    continue; // No delay needed for skip
+                }
             }
 
             // ── Scrape ────────────────────────────────────────────────────────
-            console.log(`🔄 Scraping: ${url}`);
+            console.log(`🔄 Scraping${force ? ' (force)' : ''}: ${url}`);
             const perfume = await scrapePerfume(url);
 
             if (perfume) {
@@ -823,11 +830,9 @@ router.post('/rescrape/brand', requireSuperAdmin, async (req, res, next) => {
             return res.json({ success: true, processed: results.length, failed: errors.length, results, errors });
         }
 
-        // Queue mode — re-scrape clears done/failed status for these URLs so they run again
+        // Queue mode — re-scrape with force=true so existsBySourceUrl check is bypassed
         const urls = brandPerfumes.map(p => p.sourceUrl).filter(Boolean);
-        // For re-scrape, reset existing queue entries to pending; enqueue new ones
-        await dataStore.queueClear('done').catch(() => {});
-        const added = await enqueueUrls(urls, true);
+        const added = await enqueueUrls(urls, true, true); // force=true
 
         const stats = await dataStore.queueStats().catch(() => ({}));
         res.json({ success: true, added, queueSize: stats.pending ?? added, autoStarted: true });
@@ -921,7 +926,8 @@ router.post('/rescrape/queue', requireSuperAdmin, async (req, res, next) => {
         }
 
         const urlsToAdd = perfumes.filter((p) => p.sourceUrl).map((p) => p.sourceUrl);
-        const added = await enqueueUrls(urlsToAdd, true);
+        // force=true: bypass existsBySourceUrl check so incomplete perfumes get re-scraped
+        const added = await enqueueUrls(urlsToAdd, true, true);
 
         const stats = await dataStore.queueStats().catch(() => ({}));
         res.json({ success: true, added, queueSize: stats.pending ?? added, autoStarted: true });
