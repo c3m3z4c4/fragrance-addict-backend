@@ -152,6 +152,38 @@ router.get('/me', requireAuth, (req, res) => {
     res.json({ user: safeUser(req.user) });
 });
 
+// ─── PATCH /api/auth/me ───────────────────────────────────────────────────────
+
+router.patch('/me', requireAuth, async (req, res, next) => {
+    const { name, avatarUrl } = req.body;
+    if (!name && !avatarUrl) {
+        return next(new ApiError('No fields to update', 400));
+    }
+    try {
+        const updated = await dataStore.updateUserProfile(req.user.id, { name, avatarUrl });
+        if (!updated) return next(new ApiError('Update failed', 500));
+        res.json({ user: safeUser(updated) });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// ─── DELETE /api/auth/users/:id ──────────────────────────────────────────────
+
+router.delete('/users/:id', requireSuperAdmin, async (req, res, next) => {
+    const { id } = req.params;
+    if (id === req.user.id) {
+        return next(new ApiError('Cannot deactivate yourself', 400));
+    }
+    try {
+        const updated = await dataStore.updateUser(id, { is_active: false });
+        if (!updated) return next(new ApiError('User not found', 404));
+        res.json({ success: true });
+    } catch (err) {
+        next(err);
+    }
+});
+
 // ─── GET /api/auth/users ──────────────────────────────────────────────────────
 
 router.get('/users', requireSuperAdmin, async (req, res, next) => {

@@ -10,6 +10,7 @@ import authRoutes from './routes/auth.js';
 import favoritesRoutes from './routes/favorites.js';
 import contentRoutes from './routes/content.js';
 import aiRoutes from './routes/ai.js';
+import activityRoutes from './routes/activity.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { initDatabase, dataStore, getConnectionError } from './services/dataStore.js';
 import { requireSuperAdmin } from './middleware/auth.js';
@@ -113,6 +114,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/favorites', favoritesRoutes);
 app.use('/api/content', contentRoutes);
 app.use('/api/ai', aiRoutes);
+app.use('/api/activity', activityRoutes);
 
 // Error handler
 app.use(errorHandler);

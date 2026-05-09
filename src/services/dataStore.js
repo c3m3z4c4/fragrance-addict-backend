@@ -264,6 +264,22 @@ export const initDatabase = async () => {
         ALTER TABLE scrape_queue ADD COLUMN force BOOLEAN DEFAULT FALSE;
       END IF;
     END $$;
+
+    -- ===== ACTIVITY EVENTS TABLE =====
+    CREATE TABLE IF NOT EXISTS activity_events (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      session_id VARCHAR(64) NOT NULL,
+      event_type VARCHAR(50) NOT NULL,
+      entity_id TEXT,
+      entity_name TEXT,
+      metadata JSONB DEFAULT '{}',
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_activity_user_id ON activity_events(user_id);
+    CREATE INDEX IF NOT EXISTS idx_activity_session_id ON activity_events(session_id);
+    CREATE INDEX IF NOT EXISTS idx_activity_event_type ON activity_events(event_type);
+    CREATE INDEX IF NOT EXISTS idx_activity_created_at ON activity_events(created_at DESC);
   `;
 
     try {
@@ -1280,6 +1296,95 @@ export const dataStore = {
         } catch (err) {
             console.error('❌ getAllUsers:', err.message);
             return [];
+        }
+    },
+
+    updateUserProfile: async (id, { name, avatarUrl }) => {
+        if (!isDatabaseConnected) return null;
+        const fields = {};
+        if (name !== undefined) fields['name'] = name;
+        if (avatarUrl !== undefined) fields['avatar_url'] = avatarUrl;
+        if (Object.keys(fields).length === 0) return null;
+        const setClauses = Object.keys(fields).map((k, i) => `${k} = $${i + 1}`);
+        setClauses.push('updated_at = NOW()');
+        const values = [...Object.values(fields), id];
+        try {
+            const result = await pool.query(
+                `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${values.length} RETURNING id, email, name, avatar_url, role, provider, is_active, created_at`,
+                values
+            );
+            return result.rows[0] || null;
+        } catch (err) {
+            console.error('❌ updateUserProfile:', err.message);
+            return null;
+        }
+    },
+
+    // ===== ACTIVITY METHODS =====
+
+    logActivity: async ({ userId, sessionId, eventType, entityId, entityName, metadata = {} }) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            await pool.query(
+                `INSERT INTO activity_events (user_id, session_id, event_type, entity_id, entity_name, metadata)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [userId || null, sessionId, eventType, entityId || null, entityName || null, JSON.stringify(metadata)]
+            );
+        } catch (err) {
+            console.error('❌ logActivity:', err.message);
+        }
+    },
+
+    getActivityStats: async ({ limit = 100, eventType } = {}) => {
+        if (!isDatabaseConnected) return { events: [], summary: {} };
+        try {
+            let q = `SELECT ae.id, ae.session_id, ae.event_type, ae.entity_id, ae.entity_name, ae.metadata, ae.created_at,
+                            u.id as user_id, u.email, u.name as user_name, u.avatar_url
+                     FROM activity_events ae
+                     LEFT JOIN users u ON ae.user_id = u.id`;
+            const params = [];
+            if (eventType) {
+                q += ` WHERE ae.event_type = $1`;
+                params.push(eventType);
+            }
+            q += ` ORDER BY ae.created_at DESC LIMIT $${params.length + 1}`;
+            params.push(limit);
+
+            const eventsResult = await pool.query(q, params);
+
+            const summaryResult = await pool.query(`
+                SELECT
+                  COUNT(*) FILTER (WHERE event_type = 'perfume_view') AS perfume_views,
+                  COUNT(*) FILTER (WHERE event_type = 'brand_search') AS brand_searches,
+                  COUNT(DISTINCT session_id) AS unique_sessions,
+                  COUNT(DISTINCT user_id) AS unique_users
+                FROM activity_events
+                WHERE created_at > NOW() - INTERVAL '24 hours'
+            `);
+
+            const topPerfumes = await pool.query(`
+                SELECT entity_name, COUNT(*) as views
+                FROM activity_events
+                WHERE event_type = 'perfume_view' AND created_at > NOW() - INTERVAL '7 days'
+                GROUP BY entity_name ORDER BY views DESC LIMIT 10
+            `);
+
+            const topBrands = await pool.query(`
+                SELECT entity_name, COUNT(*) as searches
+                FROM activity_events
+                WHERE event_type = 'brand_search' AND created_at > NOW() - INTERVAL '7 days'
+                GROUP BY entity_name ORDER BY searches DESC LIMIT 10
+            `);
+
+            return {
+                events: eventsResult.rows,
+                summary: summaryResult.rows[0],
+                topPerfumes: topPerfumes.rows,
+                topBrands: topBrands.rows,
+            };
+        } catch (err) {
+            console.error('❌ getActivityStats:', err.message);
+            return { events: [], summary: {}, topPerfumes: [], topBrands: [] };
         }
     },
 
