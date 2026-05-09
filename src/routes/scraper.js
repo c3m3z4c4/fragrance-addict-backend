@@ -1116,10 +1116,12 @@ router.delete('/duplicates', requireSuperAdmin, async (req, res, next) => {
 router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
     try {
         const brandsResult = await dataStore.getBrands();
-        const brandNames = brandsResult.map(b => b.name).filter(Boolean);
+        // Only process brands that do not already have a logo_url set
+        const brandsToProcess = brandsResult.filter(b => b.name && !b.logo_url);
+        const brandNames = brandsToProcess.map(b => b.name);
 
         if (brandNames.length === 0) {
-            return res.json({ success: true, updated: 0, failed: 0, results: [] });
+            return res.json({ success: true, total: 0, updated: 0, failed: 0, results: [], message: 'All brands already have logos.' });
         }
 
         const results = [];
@@ -1150,6 +1152,20 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
+// GET /api/scrape/brands/without-logos — list of brand names with no logo in DB
+router.get('/brands/without-logos', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const brandsResult = await dataStore.getBrands();
+        const missing = brandsResult
+            .filter(b => b.name && !b.logo_url)
+            .map(b => b.name)
+            .sort();
+        res.json({ success: true, total: missing.length, brands: missing });
+    } catch (err) {
+        next(err);
+    }
+});
+
 // ─── Multi-source brand logo resolver ────────────────────────────────────────
 
 async function fetchBrandLogo(brandName) {
@@ -1174,41 +1190,42 @@ async function fetchBrandLogo(brandName) {
     return null;
 }
 
-// Wikipedia REST API: returns article thumbnail, reliable for major brands
+// Wikipedia REST API: STRICT logo-only — only accept SVG files or URLs explicitly containing "logo".
+// Rejects article thumbnails (portraits, product photos, etc.) that Wikipedia uses for people/brands.
 async function fetchWikipediaLogo(brandName) {
     try {
         const { default: axios } = await import('axios');
-        const query = encodeURIComponent(brandName.trim());
 
-        // Try exact name first, then with "perfume" qualifier
-        const endpoints = [
-            `https://en.wikipedia.org/api/rest_v1/page/summary/${query}`,
-            `https://en.wikipedia.org/api/rest_v1/page/summary/${query}_(brand)`,
-            `https://en.wikipedia.org/api/rest_v1/page/summary/${query}_(company)`,
-        ];
+        // Use the MediaWiki API to search for an explicit logo file on Wikimedia Commons
+        const searchQuery = encodeURIComponent(`${brandName} logo`);
+        const searchRes = await axios.get(
+            `https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch=${searchQuery}&srnamespace=6&srlimit=5&format=json`,
+            { timeout: 6000, headers: { 'User-Agent': 'FragranceAddict/1.0 (brand-logo-fetcher)' } }
+        ).catch(() => null);
 
-        for (const url of endpoints) {
-            const res = await axios.get(url, {
-                timeout: 6000,
-                headers: { 'User-Agent': 'FragranceAddict/1.0 (brand-logo-fetcher)' },
-            }).catch(() => null);
+        if (searchRes?.data?.query?.search?.length > 0) {
+            const normalized = brandName.toLowerCase().replace(/[^a-z0-9]/g, '');
+            for (const hit of searchRes.data.query.search) {
+                const title = (hit.title || '').toLowerCase();
+                const hitNorm = title.replace(/[^a-z0-9]/g, '');
+                // Must contain the brand name and "logo" in the file title
+                if (!title.includes('logo')) continue;
+                if (!hitNorm.includes(normalized) && !normalized.includes(hitNorm.replace('logo', '').trim())) continue;
 
-            if (!res || res.status !== 200) continue;
-            const thumb = res.data?.originalimage || res.data?.thumbnail;
-            if (!thumb?.source) continue;
+                // Get the actual image URL from Commons
+                const fileTitle = encodeURIComponent(hit.title);
+                const infoRes = await axios.get(
+                    `https://commons.wikimedia.org/w/api.php?action=query&titles=${fileTitle}&prop=imageinfo&iiprop=url&format=json`,
+                    { timeout: 5000, headers: { 'User-Agent': 'FragranceAddict/1.0 (brand-logo-fetcher)' } }
+                ).catch(() => null);
 
-            const src = thumb.source;
-            // Accept SVGs (typically logos) or images with "logo" in the URL
-            const isLikelyLogo = src.includes('.svg') || src.toLowerCase().includes('logo');
-            if (isLikelyLogo) return src;
-
-            // Also accept if article type matches (brand/company article, small square image)
-            const isCompanyArticle = ['brand', 'company', 'fashion', 'fragrance', 'perfume', 'cosmetics']
-                .some(kw => (res.data?.description || '').toLowerCase().includes(kw));
-            if (isCompanyArticle && thumb.width && thumb.height && Math.abs(thumb.width - thumb.height) < 50) {
-                return src;
+                const pages = infoRes?.data?.query?.pages || {};
+                const page = Object.values(pages)[0];
+                const imgUrl = page?.imageinfo?.[0]?.url;
+                if (imgUrl) return imgUrl;
             }
         }
+
         return null;
     } catch {
         return null;
