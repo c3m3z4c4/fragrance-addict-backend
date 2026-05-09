@@ -1109,4 +1109,82 @@ router.delete('/duplicates', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
+// ─── POST /api/scrape/brands/logos ───────────────────────────────────────────
+// Fetch brand logos from Clearbit (free, no API key) for all brands in DB.
+// Uses Clearbit autocomplete to resolve brand name → domain → logo URL.
+
+router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
+    try {
+        // Get all distinct brand names from perfumes table
+        const brandsResult = await dataStore.getBrands();
+        const brandNames = brandsResult.map(b => b.name).filter(Boolean);
+
+        if (brandNames.length === 0) {
+            return res.json({ success: true, updated: 0, failed: 0, results: [] });
+        }
+
+        const results = [];
+        let updated = 0;
+        let failed = 0;
+
+        // Process with small delay to be respectful of Clearbit
+        for (const name of brandNames) {
+            try {
+                const logoUrl = await fetchClearbitLogo(name);
+                if (logoUrl) {
+                    await dataStore.upsertBrand(name, logoUrl, null);
+                    results.push({ name, logoUrl, status: 'updated' });
+                    updated++;
+                } else {
+                    results.push({ name, logoUrl: null, status: 'not_found' });
+                    failed++;
+                }
+                // Brief pause to avoid rate-limiting
+                await new Promise(r => setTimeout(r, 120));
+            } catch (err) {
+                results.push({ name, logoUrl: null, status: 'error', error: err.message });
+                failed++;
+            }
+        }
+
+        res.json({ success: true, total: brandNames.length, updated, failed, results });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// Helper: resolve brand name → Clearbit logo URL via their free autocomplete API
+async function fetchClearbitLogo(brandName) {
+    try {
+        const query = encodeURIComponent(brandName.trim());
+        const { default: axios } = await import('axios');
+
+        // Clearbit autocomplete returns [{name, domain, logo}]
+        const res = await axios.get(
+            `https://autocomplete.clearbit.com/v1/companies/suggest?query=${query}`,
+            { timeout: 6000, headers: { 'User-Agent': 'Mozilla/5.0' } }
+        );
+
+        if (!Array.isArray(res.data) || res.data.length === 0) return null;
+
+        // Try to find a match whose name is close to the brand
+        const normalized = brandName.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const match = res.data.find(c => {
+            const cn = (c.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+            return cn === normalized || cn.startsWith(normalized) || normalized.startsWith(cn);
+        }) || res.data[0]; // fall back to first result
+
+        const logoUrl = match?.logo;
+        if (!logoUrl) return null;
+
+        // Verify the logo actually loads (HEAD request)
+        const check = await axios.head(logoUrl, { timeout: 4000 }).catch(() => null);
+        if (!check || check.status >= 400) return null;
+
+        return logoUrl;
+    } catch {
+        return null;
+    }
+}
+
 export default router;
