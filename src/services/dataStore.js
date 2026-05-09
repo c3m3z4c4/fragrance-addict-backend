@@ -1299,11 +1299,12 @@ export const dataStore = {
         }
     },
 
-    updateUserProfile: async (id, { name, avatarUrl }) => {
+    updateUserProfile: async (id, { name, avatarUrl, email }) => {
         if (!isDatabaseConnected) return null;
         const fields = {};
         if (name !== undefined) fields['name'] = name;
         if (avatarUrl !== undefined) fields['avatar_url'] = avatarUrl;
+        if (email !== undefined) fields['email'] = email;
         if (Object.keys(fields).length === 0) return null;
         const setClauses = Object.keys(fields).map((k, i) => `${k} = $${i + 1}`);
         setClauses.push('updated_at = NOW()');
@@ -1317,6 +1318,20 @@ export const dataStore = {
         } catch (err) {
             console.error('❌ updateUserProfile:', err.message);
             return null;
+        }
+    },
+
+    updateUserPassword: async (id, newPasswordHash) => {
+        if (!isDatabaseConnected) return false;
+        try {
+            await pool.query(
+                `UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+                [newPasswordHash, id]
+            );
+            return true;
+        } catch (err) {
+            console.error('❌ updateUserPassword:', err.message);
+            return false;
         }
     },
 

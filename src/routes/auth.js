@@ -153,16 +153,62 @@ router.get('/me', requireAuth, (req, res) => {
 });
 
 // ─── PATCH /api/auth/me ───────────────────────────────────────────────────────
+// Update own name, avatarUrl, or email. Password change is a separate endpoint.
 
 router.patch('/me', requireAuth, async (req, res, next) => {
-    const { name, avatarUrl } = req.body;
-    if (!name && !avatarUrl) {
+    const { name, avatarUrl, email } = req.body;
+    if (!name && !avatarUrl && !email) {
         return next(new ApiError('No fields to update', 400));
     }
+
+    // If changing email, verify it isn't already taken
+    if (email) {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            return next(new ApiError('Invalid email format', 400));
+        }
+        const existing = await dataStore.getUserByEmail(email);
+        if (existing && existing.id !== req.user.id) {
+            return next(new ApiError('Email already in use', 409));
+        }
+    }
+
     try {
-        const updated = await dataStore.updateUserProfile(req.user.id, { name, avatarUrl });
+        const updated = await dataStore.updateUserProfile(req.user.id, { name, avatarUrl, email });
         if (!updated) return next(new ApiError('Update failed', 500));
         res.json({ user: safeUser(updated) });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// ─── PATCH /api/auth/me/password ─────────────────────────────────────────────
+// Change own password — requires currentPassword for local accounts.
+
+router.patch('/me/password', requireAuth, async (req, res, next) => {
+    const { currentPassword, newPassword } = req.body;
+    if (!newPassword || newPassword.length < 8) {
+        return next(new ApiError('New password must be at least 8 characters', 400));
+    }
+
+    try {
+        // Re-fetch to get password_hash (safeUser strips it)
+        const fullUser = await dataStore.getUserById(req.user.id);
+        if (!fullUser) return next(new ApiError('User not found', 404));
+
+        // Local-provider users must provide their current password
+        if (fullUser.provider === 'local' || fullUser.password_hash) {
+            if (!currentPassword) {
+                return next(new ApiError('Current password is required', 400));
+            }
+            const valid = await bcrypt.compare(currentPassword, fullUser.password_hash);
+            if (!valid) return next(new ApiError('Current password is incorrect', 401));
+        }
+
+        const hash = await bcrypt.hash(newPassword, 12);
+        const ok = await dataStore.updateUserPassword(req.user.id, hash);
+        if (!ok) return next(new ApiError('Password update failed', 500));
+
+        res.json({ success: true });
     } catch (err) {
         next(err);
     }
@@ -190,6 +236,46 @@ router.get('/users', requireSuperAdmin, async (req, res, next) => {
     try {
         const users = await dataStore.getAllUsers();
         res.json({ users });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// ─── PATCH /api/auth/users/:id ───────────────────────────────────────────────
+// Admin: update email and/or reset password for any user.
+
+router.patch('/users/:id', requireSuperAdmin, async (req, res, next) => {
+    const { id } = req.params;
+    const { email, newPassword } = req.body;
+
+    if (!email && !newPassword) {
+        return next(new ApiError('Provide email or newPassword', 400));
+    }
+
+    try {
+        if (email) {
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                return next(new ApiError('Invalid email format', 400));
+            }
+            const existing = await dataStore.getUserByEmail(email);
+            if (existing && existing.id !== id) {
+                return next(new ApiError('Email already in use', 409));
+            }
+            const updated = await dataStore.updateUserProfile(id, { email });
+            if (!updated) return next(new ApiError('User not found', 404));
+        }
+
+        if (newPassword) {
+            if (newPassword.length < 8) {
+                return next(new ApiError('Password must be at least 8 characters', 400));
+            }
+            const hash = await bcrypt.hash(newPassword, 12);
+            const ok = await dataStore.updateUserPassword(id, hash);
+            if (!ok) return next(new ApiError('Password reset failed', 500));
+        }
+
+        const updated = await dataStore.getUserById(id);
+        res.json({ user: safeUser(updated) });
     } catch (err) {
         next(err);
     }
