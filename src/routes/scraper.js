@@ -183,7 +183,7 @@ async function fetchBrandUrls(brand, limit = 500) {
             ];
             for (const sel of selectors) {
                 const img = document.querySelector(sel);
-                if (img?.src && !img.src.includes('logo') && img.naturalWidth > 50) return img.src;
+                if (img?.src && img.naturalWidth > 50) return img.src;
             }
             // Fallback: first fimgs.net image (Fragrantica CDN)
             const anyFimgs = document.querySelector('img[src*="fimgs.net"]');
@@ -1110,12 +1110,11 @@ router.delete('/duplicates', requireSuperAdmin, async (req, res, next) => {
 });
 
 // ─── POST /api/scrape/brands/logos ───────────────────────────────────────────
-// Fetch brand logos from Clearbit (free, no API key) for all brands in DB.
-// Uses Clearbit autocomplete to resolve brand name → domain → logo URL.
+// Fetch brand logos from multiple free sources for all brands in DB.
+// Sources tried in order: Wikipedia API, Logo.dev (if key set), Brandfetch (if key set).
 
 router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
     try {
-        // Get all distinct brand names from perfumes table
         const brandsResult = await dataStore.getBrands();
         const brandNames = brandsResult.map(b => b.name).filter(Boolean);
 
@@ -1127,10 +1126,9 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
         let updated = 0;
         let failed = 0;
 
-        // Process with small delay to be respectful of Clearbit
         for (const name of brandNames) {
             try {
-                const logoUrl = await fetchClearbitLogo(name);
+                const logoUrl = await fetchBrandLogo(name);
                 if (logoUrl) {
                     await dataStore.upsertBrand(name, logoUrl, null);
                     results.push({ name, logoUrl, status: 'updated' });
@@ -1139,8 +1137,7 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
                     results.push({ name, logoUrl: null, status: 'not_found' });
                     failed++;
                 }
-                // Brief pause to avoid rate-limiting
-                await new Promise(r => setTimeout(r, 120));
+                await new Promise(r => setTimeout(r, 150));
             } catch (err) {
                 results.push({ name, logoUrl: null, status: 'error', error: err.message });
                 failed++;
@@ -1153,35 +1150,110 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
-// Helper: resolve brand name → Clearbit logo URL via their free autocomplete API
-async function fetchClearbitLogo(brandName) {
+// ─── Multi-source brand logo resolver ────────────────────────────────────────
+
+async function fetchBrandLogo(brandName) {
+    // Source 1: Wikipedia REST API (free, no key needed)
+    const wikiLogo = await fetchWikipediaLogo(brandName);
+    if (wikiLogo) return wikiLogo;
+
+    // Source 2: Logo.dev (requires LOGO_DEV_KEY env var — free signup at logo.dev)
+    const logoDevKey = process.env.LOGO_DEV_KEY;
+    if (logoDevKey) {
+        const logoDevUrl = await fetchLogoDevLogo(brandName, logoDevKey);
+        if (logoDevUrl) return logoDevUrl;
+    }
+
+    // Source 3: Brandfetch (requires BRANDFETCH_KEY env var — free signup at brandfetch.io)
+    const brandfetchKey = process.env.BRANDFETCH_KEY;
+    if (brandfetchKey) {
+        const brandfetchUrl = await fetchBrandfetchLogo(brandName, brandfetchKey);
+        if (brandfetchUrl) return brandfetchUrl;
+    }
+
+    return null;
+}
+
+// Wikipedia REST API: returns article thumbnail, reliable for major brands
+async function fetchWikipediaLogo(brandName) {
     try {
-        const query = encodeURIComponent(brandName.trim());
         const { default: axios } = await import('axios');
+        const query = encodeURIComponent(brandName.trim());
 
-        // Clearbit autocomplete returns [{name, domain, logo}]
-        const res = await axios.get(
-            `https://autocomplete.clearbit.com/v1/companies/suggest?query=${query}`,
-            { timeout: 6000, headers: { 'User-Agent': 'Mozilla/5.0' } }
-        );
+        // Try exact name first, then with "perfume" qualifier
+        const endpoints = [
+            `https://en.wikipedia.org/api/rest_v1/page/summary/${query}`,
+            `https://en.wikipedia.org/api/rest_v1/page/summary/${query}_(brand)`,
+            `https://en.wikipedia.org/api/rest_v1/page/summary/${query}_(company)`,
+        ];
 
-        if (!Array.isArray(res.data) || res.data.length === 0) return null;
+        for (const url of endpoints) {
+            const res = await axios.get(url, {
+                timeout: 6000,
+                headers: { 'User-Agent': 'FragranceAddict/1.0 (brand-logo-fetcher)' },
+            }).catch(() => null);
 
-        // Try to find a match whose name is close to the brand
-        const normalized = brandName.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const match = res.data.find(c => {
-            const cn = (c.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-            return cn === normalized || cn.startsWith(normalized) || normalized.startsWith(cn);
-        }) || res.data[0]; // fall back to first result
+            if (!res || res.status !== 200) continue;
+            const thumb = res.data?.originalimage || res.data?.thumbnail;
+            if (!thumb?.source) continue;
 
-        const logoUrl = match?.logo;
-        if (!logoUrl) return null;
+            const src = thumb.source;
+            // Accept SVGs (typically logos) or images with "logo" in the URL
+            const isLikelyLogo = src.includes('.svg') || src.toLowerCase().includes('logo');
+            if (isLikelyLogo) return src;
 
-        // Verify the logo actually loads (HEAD request)
-        const check = await axios.head(logoUrl, { timeout: 4000 }).catch(() => null);
-        if (!check || check.status >= 400) return null;
+            // Also accept if article type matches (brand/company article, small square image)
+            const isCompanyArticle = ['brand', 'company', 'fashion', 'fragrance', 'perfume', 'cosmetics']
+                .some(kw => (res.data?.description || '').toLowerCase().includes(kw));
+            if (isCompanyArticle && thumb.width && thumb.height && Math.abs(thumb.width - thumb.height) < 50) {
+                return src;
+            }
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
 
-        return logoUrl;
+// Logo.dev: Clearbit drop-in replacement, 10k/month free with API key
+async function fetchLogoDevLogo(brandName, apiKey) {
+    try {
+        const { default: axios } = await import('axios');
+        // Logo.dev works by domain — guess the most likely domain
+        const slug = brandName.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const domains = [`${slug}.com`, `${slug}.fr`, `${slug}.co.uk`];
+
+        for (const domain of domains) {
+            const url = `https://img.logo.dev/${domain}?token=${apiKey}&format=png&size=128`;
+            const check = await axios.head(url, { timeout: 4000 }).catch(() => null);
+            if (check && check.status === 200) return url;
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+// Brandfetch: 500k/month free with API key
+async function fetchBrandfetchLogo(brandName, apiKey) {
+    try {
+        const { default: axios } = await import('axios');
+        const slug = brandName.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const domain = `${slug}.com`;
+
+        const res = await axios.get(`https://api.brandfetch.io/v2/brands/${domain}`, {
+            timeout: 6000,
+            headers: { Authorization: `Bearer ${apiKey}` },
+        }).catch(() => null);
+
+        if (!res || res.status !== 200) return null;
+        const logos = res.data?.logos;
+        if (!Array.isArray(logos) || logos.length === 0) return null;
+
+        // Prefer SVG logo, fall back to PNG
+        const svg = logos.flatMap(l => l.formats || []).find(f => f.format === 'svg');
+        const png = logos.flatMap(l => l.formats || []).find(f => f.format === 'png');
+        return svg?.src || png?.src || null;
     } catch {
         return null;
     }
