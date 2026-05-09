@@ -26,8 +26,55 @@ const safeUser = (user) => ({
     provider: user.provider,
 });
 
+// ─── POST /api/auth/register ──────────────────────────────────────────────────
+// Public registration with email + name + password.
+
+const PASSWORD_POLICY = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;
+
+router.post('/register', async (req, res, next) => {
+    const { email, name, password } = req.body;
+
+    if (!email || !name || !password) {
+        return next(new ApiError('Email, name, and password are required', 400));
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return next(new ApiError('Invalid email format', 400));
+    }
+    if (!PASSWORD_POLICY.test(password)) {
+        return next(new ApiError(
+            'Password must be at least 8 characters and contain uppercase, lowercase, a number, and a special character',
+            400
+        ));
+    }
+
+    try {
+        const existing = await dataStore.getUserByEmail(email);
+        if (existing) {
+            return next(new ApiError('Email already registered', 409));
+        }
+
+        const adminEmail = process.env.ADMIN_EMAIL;
+        const role = adminEmail && email === adminEmail ? 'SUPERADMIN' : 'USER';
+        const passwordHash = await bcrypt.hash(password, 12);
+
+        const user = await dataStore.createUser({
+            email: email.trim().toLowerCase(),
+            name: name.trim(),
+            role,
+            provider: 'local',
+            passwordHash,
+        });
+
+        if (!user) return next(new ApiError('Registration failed', 500));
+
+        const token = signToken(user);
+        return res.status(201).json({ token, user: safeUser(user) });
+    } catch (err) {
+        return next(err);
+    }
+});
+
 // ─── POST /api/auth/login ─────────────────────────────────────────────────────
-// Email + password login (only for SUPERADMIN seeded from env or local provider)
 
 router.post('/login', async (req, res, next) => {
     const { email, password } = req.body;
