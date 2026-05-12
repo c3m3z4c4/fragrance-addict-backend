@@ -3,6 +3,11 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
+import { mkdirSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 import perfumeRoutes from './routes/perfumes.js';
 import scraperRoutes from './routes/scraper.js';
@@ -58,6 +63,11 @@ app.use(limiter);
 
 // Body parser
 app.use(express.json());
+
+// Static files for uploaded logos
+const uploadsDir = join(__dirname, '../../uploads/logos');
+mkdirSync(uploadsDir, { recursive: true });
+app.use('/uploads', express.static(join(__dirname, '../../uploads')));
 
 // Recolectar métricas de cada request
 app.use(metricsMiddleware);

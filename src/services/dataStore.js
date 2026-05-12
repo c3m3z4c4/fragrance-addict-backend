@@ -1552,6 +1552,26 @@ export const dataStore = {
         }
     },
 
+    // Force-update a brand's logo URL (always overwrites existing)
+    setBrandLogo: async (name, logoUrl) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                `INSERT INTO brands (name, logo_url)
+                 VALUES ($1, $2)
+                 ON CONFLICT (name) DO UPDATE SET
+                   logo_url = $2,
+                   scraped_at = NOW()
+                 RETURNING *`,
+                [name, logoUrl]
+            );
+            return result.rows[0] || null;
+        } catch (err) {
+            console.error('❌ setBrandLogo:', err.message);
+            return null;
+        }
+    },
+
     // Get all stored brand logos
     getBrandLogos: async () => {
         if (!isDatabaseConnected) return [];

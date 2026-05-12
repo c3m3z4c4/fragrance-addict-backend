@@ -1,10 +1,36 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
+import multer from 'multer';
+import { mkdirSync } from 'fs';
+import { join, dirname, extname } from 'path';
+import { fileURLToPath } from 'url';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const uploadsDir = join(__dirname, '../../../uploads/logos');
+mkdirSync(uploadsDir, { recursive: true });
+
+const logoStorage = multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, uploadsDir),
+    filename: (_req, file, cb) => {
+        const ext = extname(file.originalname).toLowerCase() || '.png';
+        const base = file.originalname.replace(/\.[^.]+$/, '').toLowerCase()
+            .replace(/[^a-z0-9_\-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+        cb(null, `${base}${ext}`);
+    },
+});
+const logoUpload = multer({
+    storage: logoStorage,
+    limits: { fileSize: 5 * 1024 * 1024, files: 100 },
+    fileFilter: (_req, file, cb) => {
+        const ok = /\.(png|jpg|jpeg|webp|svg)$/i.test(file.originalname);
+        cb(ok ? null : new Error('Only PNG, JPG, WEBP, SVG allowed'), ok);
+    },
+});
 
 const router = express.Router();
 
@@ -1275,5 +1301,77 @@ async function fetchBrandfetchLogo(brandName, apiKey) {
         return null;
     }
 }
+
+// ─── Logo upload: single brand ───────────────────────────────────────────────
+// POST /api/scrape/brands/logo/upload
+// Form fields: brandName (string), file (image)
+router.post(
+    '/brands/logo/upload',
+    requireSuperAdmin,
+    logoUpload.single('file'),
+    async (req, res, next) => {
+        try {
+            if (!req.file) return next(new ApiError('No file uploaded', 400));
+            const brandName = (req.body.brandName || '').trim();
+            if (!brandName) return next(new ApiError('brandName is required', 400));
+
+            const host = process.env.API_URL || `${req.protocol}://${req.get('host')}`;
+            const logoUrl = `${host}/uploads/logos/${req.file.filename}`;
+
+            await dataStore.setBrandLogo(brandName, logoUrl);
+            res.json({ success: true, brand: brandName, logoUrl });
+        } catch (err) {
+            next(err);
+        }
+    }
+);
+
+// ─── Logo upload: bulk (multiple files, filename = brand key) ─────────────────
+// POST /api/scrape/brands/logos/bulk-upload
+// Form fields: files[] (images); optional mapping[] JSON: [{filename, brandName}]
+router.post(
+    '/brands/logos/bulk-upload',
+    requireSuperAdmin,
+    logoUpload.array('files', 100),
+    async (req, res, next) => {
+        try {
+            const files = req.files;
+            if (!files || files.length === 0) return next(new ApiError('No files uploaded', 400));
+
+            // Optional explicit mapping: [{filename, brandName}]
+            let mapping = {};
+            if (req.body.mapping) {
+                try {
+                    const pairs = JSON.parse(req.body.mapping);
+                    if (Array.isArray(pairs)) {
+                        pairs.forEach(p => { if (p.filename && p.brandName) mapping[p.filename] = p.brandName; });
+                    }
+                } catch { /* ignore bad JSON */ }
+            }
+
+            const host = process.env.API_URL || `${req.protocol}://${req.get('host')}`;
+            const results = [];
+
+            for (const file of files) {
+                const logoUrl = `${host}/uploads/logos/${file.filename}`;
+                // Resolve brand name: explicit mapping → filename without ext (pretty-printed)
+                const brandName = mapping[file.originalname]
+                    || file.filename.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
+                try {
+                    await dataStore.setBrandLogo(brandName, logoUrl);
+                    results.push({ filename: file.filename, brand: brandName, logoUrl, success: true });
+                } catch (err) {
+                    results.push({ filename: file.filename, brand: brandName, success: false, error: err.message });
+                }
+            }
+
+            const updated = results.filter(r => r.success).length;
+            const failed = results.filter(r => !r.success).length;
+            res.json({ success: true, total: files.length, updated, failed, results });
+        } catch (err) {
+            next(err);
+        }
+    }
+);
 
 export default router;
