@@ -932,9 +932,11 @@ export const dataStore = {
         OR longevity IS NULL
         OR similar_perfumes IS NULL OR similar_perfumes = '[]'
         OR accords IS NULL OR accords = '[]'
+        OR (notes IS NULL OR notes = '{}')
+        OR (notes->>'top' = '[]' AND notes->>'heart' = '[]' AND notes->>'base' = '[]')
         OR (
-          (notes IS NULL OR notes = '{}')
-          OR (notes->>'top' = '[]' AND notes->>'heart' = '[]' AND notes->>'base' = '[]')
+          notes->>'top' = '[]' AND notes->>'base' = '[]'
+          AND jsonb_array_length(notes->'heart') > 3
         )
       )
         AND source_url IS NOT NULL
@@ -963,9 +965,11 @@ export const dataStore = {
         OR longevity IS NULL
         OR similar_perfumes IS NULL OR similar_perfumes = '[]'
         OR accords IS NULL OR accords = '[]'
+        OR (notes IS NULL OR notes = '{}')
+        OR (notes->>'top' = '[]' AND notes->>'heart' = '[]' AND notes->>'base' = '[]')
         OR (
-          (notes IS NULL OR notes = '{}')
-          OR (notes->>'top' = '[]' AND notes->>'heart' = '[]' AND notes->>'base' = '[]')
+          notes->>'top' = '[]' AND notes->>'base' = '[]'
+          AND jsonb_array_length(notes->'heart') > 3
         )
       )
         AND source_url IS NOT NULL

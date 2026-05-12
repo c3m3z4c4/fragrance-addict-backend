@@ -64,6 +64,9 @@ export const scrapePerfume = async (url) => {
         // Esperar a que cargue el contenido principal
         await page.waitForSelector('h1', { timeout: 30000 });
 
+        // Also wait for the notes pyramid if present (it lazy-loads on some pages)
+        await page.waitForSelector('#pyramid, [class*="pyramid"], a[href*="/notes/"]', { timeout: 10000 }).catch(() => {});
+
         // Obtener el HTML de la página
         const html = await page.content();
         const $ = cheerio.load(html);
@@ -331,9 +334,11 @@ function extractNotes($) {
     // Helper: get clean note text from a link element
     const getNoteText = (el) => {
         const $el = $(el);
-        // Note name can be in text content or in an img alt attribute
-        const text = $el.clone().children('img').remove().end().text().trim();
-        const alt = $el.find('img').attr('alt')?.trim() || '';
+        // Try direct text first (excluding img alt), then img alt as fallback
+        const clone = $el.clone();
+        clone.find('img').remove();
+        const text = clone.text().replace(/\s+/g, ' ').trim();
+        const alt = $el.find('img').first().attr('alt')?.trim() || '';
         return (text || alt).replace(/\s+/g, ' ').trim();
     };
 
@@ -345,70 +350,86 @@ function extractNotes($) {
 
     const hasNotes = (n) => n.top.length + n.heart.length + n.base.length > 0;
 
-    // ── Strategy 1: Walk children of #pyramid / .pyramid container ─────────
+    // Classify a text string as a pyramid section key (English + Spanish)
+    const classifyHeader = (raw) => {
+        const txt = raw.toLowerCase().trim();
+        if (/top\s+notes?|notas?\s+de\s+sal|salida/.test(txt)) return 'top';
+        if (/heart\s+notes?|middle\s+notes?|coraz[oó]n|notas?\s+de\s+coraz/.test(txt)) return 'heart';
+        if (/base\s+notes?|notas?\s+de\s+base|^base$/.test(txt)) return 'base';
+        return null;
+    };
+
+    // ── Strategy 1: Walk children of #pyramid / .pyramid container ──────────
+    // Handles any inline tag (<b>, <strong>, <span>, <p>, <h3>, <h4>) as header
     const pyramidContainer = $('[id="pyramid"], .pyramid, [class*="pyramid"]').first();
     if (pyramidContainer.length) {
         let currentSection = null;
-        pyramidContainer.find('b, strong, a[href*="/notes/"]').each((_, el) => {
+        const HEADER_TAGS = new Set(['b', 'strong', 'span', 'p', 'h2', 'h3', 'h4', 'label', 'div']);
+        pyramidContainer.find('*').each((_, el) => {
             const tag = el.tagName?.toLowerCase();
-            if (tag === 'b' || tag === 'strong') {
-                const txt = $(el).text().trim().toLowerCase();
-                if (/top\s+notes?/.test(txt)) currentSection = 'top';
-                else if (/heart\s+notes?|middle\s+notes?/.test(txt)) currentSection = 'heart';
-                else if (/base\s+notes?/.test(txt)) currentSection = 'base';
-            } else if (tag === 'a' && currentSection) {
-                const noteText = getNoteText(el);
-                if (noteText && noteText.length < 80) notes[currentSection].push(noteText);
+            if (!tag) return;
+
+            if (HEADER_TAGS.has(tag)) {
+                // Only use elements whose own text (not children) is the header label
+                const ownText = $(el).clone().children().remove().end().text().trim();
+                const key = classifyHeader(ownText);
+                if (key) { currentSection = key; return; }
+            }
+
+            if (tag === 'a' && currentSection) {
+                const href = $(el).attr('href') || '';
+                if (href.includes('/notes/')) {
+                    const noteText = getNoteText(el);
+                    if (noteText && noteText.length < 80) notes[currentSection].push(noteText);
+                }
             }
         });
         if (hasNotes(notes)) return dedupeNotes(notes);
     }
 
-    // ── Strategy 2: <b> or <strong> headers followed by sibling note links ─
-    const sectionPatterns = [
-        { key: 'top', re: /^top\s+notes?$/i },
-        { key: 'heart', re: /^(heart|middle)\s+notes?$/i },
-        { key: 'base', re: /^base\s+notes?$/i },
+    // ── Strategy 2: Any element whose own text matches a header, then collect
+    // note links from the parent or next sibling subtrees ─────────────────────
+    const sectionLabels = [
+        { key: 'top',   variants: ['Top Notes', 'Top notes', 'Notas de Salida', 'Notas de salida'] },
+        { key: 'heart', variants: ['Heart Notes', 'Heart notes', 'Middle Notes', 'Corazón', 'Corazon'] },
+        { key: 'base',  variants: ['Base Notes', 'Base notes', 'Base'] },
     ];
 
-    $('b, strong').each((_, el) => {
-        const txt = $(el).text().trim();
-        for (const { key, re } of sectionPatterns) {
-            if (re.test(txt)) {
-                // Collect note links from next siblings until the next header
-                let $next = $(el).next();
-                while ($next.length && !$next.is('b, strong, h2, h3, h4')) {
-                    $next.find('a[href*="/notes/"]').each((_, a) => {
+    for (const { key, variants } of sectionLabels) {
+        for (const label of variants) {
+            if (notes[key].length > 0) break;
+            $('*').filter(function () {
+                const own = $(this).clone().children().remove().end().text().trim();
+                return own.toLowerCase() === label.toLowerCase();
+            }).each((_, el) => {
+                if (notes[key].length > 0) return;
+                // Try parent's subtree, then next siblings up to 3 levels
+                const $el = $(el);
+                const candidates = [$el.parent(), $el.parent().next(), $el.next(), $el.next().next()];
+                for (const $c of candidates) {
+                    $c.find('a[href*="/notes/"]').each((_, a) => {
                         const noteText = getNoteText(a);
                         if (noteText && noteText.length < 80) notes[key].push(noteText);
                     });
-                    $next = $next.next();
+                    if (notes[key].length) break;
                 }
-
-                // Also try the parent's next sibling (common in Fragrantica's structure)
-                if (notes[key].length === 0) {
-                    $(el).parent().next().find('a[href*="/notes/"]').each((_, a) => {
-                        const noteText = getNoteText(a);
-                        if (noteText && noteText.length < 80) notes[key].push(noteText);
-                    });
-                }
-                break;
-            }
+            });
         }
-    });
+    }
     if (hasNotes(notes)) return dedupeNotes(notes);
 
-    // ── Strategy 3: Walk ALL elements in order, track <b> section headers ──
-    // This handles nested structures where notes are not direct siblings
+    // ── Strategy 3: Walk ALL elements tracking any header tag ────────────────
     let currentSection = null;
-    $('b, strong, a[href*="/notes/"]').each((_, el) => {
+    $('*').each((_, el) => {
         const tag = el.tagName?.toLowerCase();
-        if (tag === 'b' || tag === 'strong') {
-            const txt = $(el).text().trim().toLowerCase();
-            if (/top\s+notes?/.test(txt)) currentSection = 'top';
-            else if (/heart\s+notes?|middle\s+notes?/.test(txt)) currentSection = 'heart';
-            else if (/base\s+notes?/.test(txt)) currentSection = 'base';
-        } else if (tag === 'a' && currentSection) {
+        if (!tag || tag === 'html' || tag === 'body' || tag === 'head' || tag === 'script' || tag === 'style') return;
+
+        // Check if element is a header (its own text only, no children text)
+        const ownText = $(el).clone().children().remove().end().text().trim();
+        const key = classifyHeader(ownText);
+        if (key) { currentSection = key; return; }
+
+        if (tag === 'a' && currentSection) {
             const href = $(el).attr('href') || '';
             if (href.includes('/notes/')) {
                 const noteText = getNoteText(el);
@@ -418,35 +439,36 @@ function extractNotes($) {
     });
     if (hasNotes(notes)) return dedupeNotes(notes);
 
-    // ── Strategy 4: Text scan — find "Top Notes", "Heart Notes", "Base Notes"
-    // as text nodes in any element, then harvest nearby note links
-    const textSectionSearch = (labelText) => {
-        const found = [];
-        $('*').filter(function () {
-            const own = $(this).clone().children().remove().end().text().trim();
-            return own.toLowerCase() === labelText.toLowerCase();
-        }).first().parent().find('a[href*="/notes/"]').each((_, a) => {
+    // ── Strategy 4: Positional — group /notes/ links by proximity to headers ─
+    // Collect all note link positions and all header positions, then assign each
+    // note to the nearest preceding header.
+    const headers = [];
+    $('*').each((_, el) => {
+        const own = $(el).clone().children().remove().end().text().trim();
+        const key = classifyHeader(own);
+        if (key) headers.push({ key, el });
+    });
+
+    if (headers.length >= 2) {
+        // For each note link, find the closest preceding header
+        $('a[href*="/notes/"]').each((_, a) => {
             const noteText = getNoteText(a);
-            if (noteText && noteText.length < 80) found.push(noteText);
+            if (!noteText || noteText.length >= 80) return;
+
+            // Use DOM position: find the last header that appears before this link in document order
+            let assignedKey = null;
+            for (const h of headers) {
+                // compareDocumentPosition: bit 4 = a follows h
+                const pos = h.el.compareDocumentPosition?.(a);
+                if (pos === undefined || (pos & 4)) assignedKey = h.key; // a comes after h
+            }
+            if (assignedKey) notes[assignedKey].push(noteText);
         });
-        return found;
-    };
+        if (hasNotes(notes)) return dedupeNotes(notes);
+    }
 
-    notes.top = textSectionSearch('Top Notes').length
-        ? textSectionSearch('Top Notes')
-        : textSectionSearch('Top notes');
-    notes.heart = textSectionSearch('Heart Notes').length
-        ? textSectionSearch('Heart Notes')
-        : textSectionSearch('Middle Notes');
-    notes.base = textSectionSearch('Base Notes').length
-        ? textSectionSearch('Base Notes')
-        : textSectionSearch('Base notes');
-
-    if (hasNotes(notes)) return dedupeNotes(notes);
-
-    // ── Final fallback: all /notes/ links, unclassified → put in heart ─────
-    // Do NOT distribute evenly — keep them in heart to signal they exist but
-    // the pyramid structure could not be parsed from this page.
+    // ── Final fallback: all /notes/ links, unclassified → heart ─────────────
+    // Keeps notes visible in the UI while signalling the pyramid couldn't be parsed.
     const allNotes = new Set();
     $('a[href*="/notes/"]').each((_, el) => {
         const noteText = getNoteText(el);
@@ -454,9 +476,7 @@ function extractNotes($) {
             allNotes.add(noteText);
         }
     });
-    if (allNotes.size > 0) {
-        notes.heart = [...allNotes];
-    }
+    if (allNotes.size > 0) notes.heart = [...allNotes];
 
     return notes;
 }
