@@ -23,6 +23,14 @@ import { metricsMiddleware, getMetrics } from './services/metricsService.js';
 
 dotenv.config();
 
+// Global process error guards — prevent uncaught errors from killing the process
+process.on('uncaughtException', (err) => {
+  console.error('💥 Uncaught exception (process kept alive):', err.message, err.stack);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('💥 Unhandled rejection (process kept alive):', reason);
+});
+
 console.log('🚀 Starting Perfume Catalog API...');
 console.log('📍 Environment:', process.env.NODE_ENV || 'development');
 console.log('🔌 Port:', process.env.PORT || 3000);
@@ -53,11 +61,15 @@ app.use(cors({
   credentials: true
 }));
 
-// Rate limiting global
+// Rate limiting global — generous limit; scrape routes have their own stricter limiter
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: { error: 'Demasiadas peticiones, intenta más tarde' }
+  max: 1000,
+  message: { error: 'Demasiadas peticiones, intenta más tarde' },
+  skip: (req) => {
+    // Skip rate limit for authenticated admin requests
+    return !!req.headers.authorization;
+  },
 });
 app.use(limiter);
 

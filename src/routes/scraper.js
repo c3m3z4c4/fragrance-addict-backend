@@ -1,30 +1,15 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
-import { mkdirSync } from 'fs';
-import { join, dirname, extname } from 'path';
-import { fileURLToPath } from 'url';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const uploadsDir = join(__dirname, '../../uploads/logos');
-try { mkdirSync(uploadsDir, { recursive: true }); } catch { /* ignore */ }
-
-const logoStorage = multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, uploadsDir),
-    filename: (_req, file, cb) => {
-        const ext = extname(file.originalname).toLowerCase() || '.png';
-        const base = file.originalname.replace(/\.[^.]+$/, '').toLowerCase()
-            .replace(/[^a-z0-9_\-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
-        cb(null, `${base}${ext}`);
-    },
-});
+// Memory storage — logos stored as base64 data URLs in the DB, no disk dependency
 const logoUpload = multer({
-    storage: logoStorage,
+    storage: multer.memoryStorage(),
     limits: { fileSize: 5 * 1024 * 1024, files: 100 },
     fileFilter: (_req, file, cb) => {
         const ok = /\.(png|jpg|jpeg|webp|svg)$/i.test(file.originalname);
@@ -1315,8 +1300,8 @@ router.post(
             const brandName = (req.body.brandName || '').trim();
             if (!brandName) return next(new ApiError('brandName is required', 400));
 
-            const host = process.env.API_URL || `${req.protocol}://${req.get('host')}`;
-            const logoUrl = `${host}/uploads/logos/${req.file.filename}`;
+            const mime = req.file.mimetype || 'image/png';
+            const logoUrl = `data:${mime};base64,${req.file.buffer.toString('base64')}`;
 
             await dataStore.setBrandLogo(brandName, logoUrl);
             res.json({ success: true, brand: brandName, logoUrl });
@@ -1349,19 +1334,19 @@ router.post(
                 } catch { /* ignore bad JSON */ }
             }
 
-            const host = process.env.API_URL || `${req.protocol}://${req.get('host')}`;
             const results = [];
 
             for (const file of files) {
-                const logoUrl = `${host}/uploads/logos/${file.filename}`;
-                // Resolve brand name: explicit mapping → filename without ext (pretty-printed)
+                const mime = file.mimetype || 'image/png';
+                const logoUrl = `data:${mime};base64,${file.buffer.toString('base64')}`;
+                // Resolve brand name: explicit mapping → original filename without ext
                 const brandName = mapping[file.originalname]
-                    || file.filename.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
+                    || file.originalname.replace(/\.[^.]+$/, '');
                 try {
                     await dataStore.setBrandLogo(brandName, logoUrl);
-                    results.push({ filename: file.filename, brand: brandName, logoUrl, success: true });
+                    results.push({ filename: file.originalname, brand: brandName, logoUrl: logoUrl.slice(0, 60) + '…', success: true });
                 } catch (err) {
-                    results.push({ filename: file.filename, brand: brandName, success: false, error: err.message });
+                    results.push({ filename: file.originalname, brand: brandName, success: false, error: err.message });
                 }
             }
 
