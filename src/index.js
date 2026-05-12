@@ -65,9 +65,9 @@ app.use(limiter);
 app.use(express.json());
 
 // Static files for uploaded logos
-const uploadsDir = join(__dirname, '../../uploads/logos');
-mkdirSync(uploadsDir, { recursive: true });
-app.use('/uploads', express.static(join(__dirname, '../../uploads')));
+const uploadsBase = join(__dirname, '../uploads');
+try { mkdirSync(join(uploadsBase, 'logos'), { recursive: true }); } catch { /* ignore */ }
+app.use('/uploads', express.static(uploadsBase));
 
 // Recolectar métricas de cada request
 app.use(metricsMiddleware);

@@ -11,8 +11,8 @@ import { requireSuperAdmin } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const uploadsDir = join(__dirname, '../../../uploads/logos');
-mkdirSync(uploadsDir, { recursive: true });
+const uploadsDir = join(__dirname, '../../uploads/logos');
+try { mkdirSync(uploadsDir, { recursive: true }); } catch { /* ignore */ }
 
 const logoStorage = multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, uploadsDir),
