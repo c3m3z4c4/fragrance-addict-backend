@@ -1,7 +1,7 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
-import { scrapePerfume } from '../services/scrapingService.js';
+import { scrapePerfume, BROWSER_CONFIG } from '../services/scrapingService.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
@@ -159,16 +159,13 @@ router.post('/batch', requireSuperAdmin, async (req, res, next) => {
 
 async function fetchBrandUrls(brand, limit = 500) {
     const puppeteer = (await import('puppeteer')).default;
-    const browser = await puppeteer.launch({
-        headless: 'new',
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    });
-
+    let browser = null;
     try {
+    browser = await puppeteer.launch(BROWSER_CONFIG);
+
         const page = await browser.newPage();
         await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         );
 
         const brandSlug = brand.trim()
@@ -179,8 +176,9 @@ async function fetchBrandUrls(brand, limit = 500) {
         const brandUrl = `https://www.fragrantica.com/designers/${brandSlug}.html`;
         console.log(`🔍 Fetching brand page: ${brandUrl}`);
 
-        await page.goto(brandUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-        await page.waitForSelector('a[href*="/perfume/"]', { timeout: 10000 }).catch(() => {});
+        // domcontentloaded is enough — we only need links, not full network idle
+        await page.goto(brandUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForSelector('a[href*="/perfume/"]', { timeout: 15000 }).catch(() => {});
 
         // Extract brand logo — Fragrantica stores brand images in their CDN
         const logoUrl = await page.evaluate(() => {
@@ -210,7 +208,7 @@ async function fetchBrandUrls(brand, limit = 500) {
         console.log(`  Found ${urls.length} URLs for brand "${brand}", logo: ${logoUrl ? 'yes' : 'no'}`);
         return { urls, brandUrl, logoUrl };
     } finally {
-        await browser.close();
+        if (browser) await browser.close().catch(() => {});
     }
 }
 
@@ -345,18 +343,11 @@ router.post('/sitemap', requireSuperAdmin, async (req, res, next) => {
         );
 
         const puppeteer = (await import('puppeteer')).default;
-        const browser = await puppeteer.launch({
-            headless: 'new',
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-            ],
-        });
+        const browser = await puppeteer.launch(BROWSER_CONFIG);
 
         const page = await browser.newPage();
         await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         );
 
         let urls = [];
@@ -449,7 +440,7 @@ router.post('/sitemap', requireSuperAdmin, async (req, res, next) => {
                 }
             } catch (navError) {
                 console.error(`Navigation error: ${navError.message}`);
-                await browser.close();
+                await browser.close().catch(() => {});
                 return res.json({
                     success: false,
                     error: `Could not load brand page for "${brand}". Make sure the brand name matches exactly as shown on Fragrantica (e.g., "Dior", "Tom Ford", "Chanel").`,
@@ -496,7 +487,7 @@ router.post('/sitemap', requireSuperAdmin, async (req, res, next) => {
             }
         }
 
-        await browser.close();
+        await browser.close().catch(() => {});
 
         // Limit results
         urls = urls.slice(0, parseInt(limit));
@@ -1008,11 +999,7 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
         let browser = null;
         try {
             const puppeteer = (await import('puppeteer')).default;
-            browser = await puppeteer.launch({
-                headless: 'new',
-                executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-            });
+            browser = await puppeteer.launch(BROWSER_CONFIG);
 
             const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 

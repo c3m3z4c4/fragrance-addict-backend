@@ -8,20 +8,32 @@ const SCRAPE_DELAY = parseInt(process.env.SCRAPE_DELAY_MS) || 3000;
 // Delay entre requests
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Configuración del navegador
-const getBrowserConfig = () => ({
+// Shared browser config — exported so routes/scraper.js can reuse it
+export const BROWSER_CONFIG = {
     headless: 'new',
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    protocolTimeout: 60000, // CDP command timeout (Network.enable, etc.)
     args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
-        '--window-size=1920,1080',
+        '--window-size=1280,800',
         '--disable-blink-features=AutomationControlled',
+        '--disable-extensions',
+        '--disable-default-apps',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--no-first-run',
+        '--mute-audio',
+        '--disable-background-timer-throttling',
+        '--disable-renderer-backgrounding',
     ],
-});
+};
+
+// Keep local alias for backward-compat within this file
+const getBrowserConfig = () => BROWSER_CONFIG;
 
 // Scraper con Puppeteer para Fragrantica.com
 export const scrapePerfume = async (url) => {
@@ -154,9 +166,7 @@ export const scrapePerfume = async (url) => {
         console.error(`❌ Error scraping ${url}:`, error.message);
         throw new Error(`Error al scrapear: ${error.message}`);
     } finally {
-        if (browser) {
-            await browser.close();
-        }
+        if (browser) await browser.close().catch(() => {});
     }
 };
 
