@@ -683,6 +683,19 @@ export const dataStore = {
         return result.rows.map(toCamelCase);
     },
 
+    // Export all perfumes (optionally filtered by brand) for backup
+    exportAll: async ({ brand } = {}) => {
+        if (!isDatabaseConnected) {
+            return memoryStore.filter(p => !brand || p.brand === brand);
+        }
+        const query = brand
+            ? 'SELECT * FROM perfumes WHERE brand = $1 ORDER BY brand, name'
+            : 'SELECT * FROM perfumes ORDER BY brand, name';
+        const params = brand ? [brand] : [];
+        const result = await pool.query(query, params);
+        return result.rows.map(toCamelCase);
+    },
+
     // Obtener todas las marcas con imagen representativa y conteo
     getBrands: async () => {
         if (!isDatabaseConnected) {

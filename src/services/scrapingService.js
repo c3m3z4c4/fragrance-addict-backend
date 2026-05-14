@@ -79,6 +79,12 @@ export const scrapePerfume = async (url) => {
         // Also wait for the notes pyramid if present (it lazy-loads on some pages)
         await page.waitForSelector('#pyramid, [class*="pyramid"], a[href*="/notes/"]', { timeout: 10000 }).catch(() => {});
 
+        // Scroll down to trigger lazy-loaded vote widgets
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+        await new Promise(r => setTimeout(r, 1500));
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        await new Promise(r => setTimeout(r, 1000));
+
         // Obtener el HTML de la página
         const html = await page.content();
         const $ = cheerio.load(html);
@@ -655,80 +661,84 @@ const SILLAGE_LABELS = {
 
 function extractPerformanceMetric($, metric) {
     const labelMap = metric === 'longevity' ? LONGEVITY_LABELS : SILLAGE_LABELS;
-    const keywords = metric === 'longevity'
-        ? ['longevity', 'longevidad', 'lasting', 'durance']
-        : ['sillage', 'estela', 'trail', 'projection', 'proyección'];
-
     const votes = {};
 
-    // ── Strategy 1: Fragrantica vote-button structure ─────────────────────
-    // <div class="cell ... longevity ..."> or heading containing keyword
-    // then children with .vote-button-legend + counts
-    const tryVoteButtons = (container) => {
-        container.find('[class*="vote-button"], .vote_chart_graph, .vote-button-wrap').each((_, el) => {
-            const $el = $(el);
-            // Try to find a label (name) and a count in this element or its children
-            const labelEl = $el.find('[class*="name"], [class*="legend"], [class*="label"]').first();
-            const countEl = $el.find('[class*="count"], [class*="num"], [class*="votes"]').first();
-            const labelTxt = (labelEl.length ? labelEl.text() : $el.clone().children().remove().end().text()).trim().toLowerCase();
-            const countTxt = (countEl.length ? countEl.text() : '').trim().replace(/,/g, '');
-            const key = labelMap[labelTxt];
-            const count = parseInt(countTxt, 10);
-            if (key && !isNaN(count) && count >= 0) {
-                // Use max (not sum) to avoid double-counting from nested container scans
-                votes[key] = Math.max(votes[key] || 0, count);
-            }
-        });
+    // Helper: find a numeric vote count adjacent to a label element
+    const extractCount = ($el) => {
+        const candidates = [
+            $el.next(),
+            $el.prev(),
+            $el.parent().children().not($el[0]),
+            $el.parent().next(),
+            $el.parent().prev(),
+            $el.closest('[class*="vote"], [class*="bar"], [class*="chart"]').find('[class*="count"], [class*="num"], [class*="score"]'),
+        ];
+        for (const $c of candidates) {
+            let found = null;
+            $c.each((_, c) => {
+                if (found !== null) return;
+                const txt = $(c).text().trim().replace(/[,.\s]/g, '');
+                const n = parseInt(txt, 10);
+                if (!isNaN(n) && n >= 0 && txt.length < 8) found = n;
+            });
+            if (found !== null) return found;
+        }
+        return null;
     };
 
-    // Find the container section that matches this metric
-    $('[class*="cell"], [class*="col"], section, div').each((_, el) => {
+    // Strategy 1: scan ALL elements whose own text matches a known label
+    $('span, div, p, td, li, b, strong, label').each((_, el) => {
         const $el = $(el);
-        const text = $el.clone().children().remove().end().text().trim().toLowerCase();
-        const cls = ($el.attr('class') || '').toLowerCase();
-        if (keywords.some(kw => text.includes(kw) || cls.includes(kw))) {
-            tryVoteButtons($el);
+        const ownText = $el.clone().children().remove().end().text().trim().toLowerCase();
+        const key = labelMap[ownText];
+        if (!key) return;
+        const count = extractCount($el);
+        if (count !== null) {
+            votes[key] = Math.max(votes[key] || 0, count);
+        } else {
+            if (!votes[key]) votes[key] = 0;
         }
     });
 
-    // ── Strategy 2: Look for any heading with the keyword, then nearby vote buttons ─
-    if (Object.keys(votes).length === 0) {
-        $('b, strong, h3, h4, p').each((_, el) => {
+    // Strategy 2: elements with "vote"/"chart"/"bar" in class — extract label+count from subtree
+    if (Object.keys(votes).filter(k => votes[k] > 0).length === 0) {
+        $('[class*="vote"], [class*="chart"], [class*="bar-item"], [class*="bar_item"]').each((_, el) => {
             const $el = $(el);
-            const txt = $el.text().trim().toLowerCase();
-            if (keywords.some(kw => txt === kw || txt.startsWith(kw))) {
-                // Check parent and siblings
-                tryVoteButtons($el.parent());
-                tryVoteButtons($el.parent().parent());
+            const txt = $el.text().toLowerCase();
+            for (const [label, key] of Object.entries(labelMap)) {
+                if (txt.includes(label)) {
+                    $el.find('*').each((__, c) => {
+                        const childText = $(c).clone().children().remove().end().text().trim().replace(/,/g, '');
+                        const n = parseInt(childText, 10);
+                        if (!isNaN(n) && n >= 0 && childText.length < 8) {
+                            votes[key] = Math.max(votes[key] || 0, n);
+                        }
+                    });
+                }
             }
         });
     }
 
-    // ── Strategy 3: Scan all labels across page that match this metric ────
-    if (Object.keys(votes).length === 0) {
-        $('[class*="vote"], [class*="chart"]').each((_, el) => {
-            const $el = $(el);
-            const allText = $el.text().toLowerCase();
-            const hasKeyword = keywords.some(kw => allText.includes(kw));
-            const hasLabel = Object.keys(labelMap).some(lbl => allText.includes(lbl));
-            if (hasKeyword || hasLabel) {
-                // Try to parse label|count pairs from text
-                Object.keys(labelMap).forEach(lbl => {
-                    const regex = new RegExp(`${lbl}[^\\d]*(\\d[\\d,]*)`, 'i');
-                    const m = allText.match(regex);
-                    if (m) {
-                        const key = labelMap[lbl];
-                        const count = parseInt(m[1].replace(/,/g, ''), 10);
-                        if (!isNaN(count)) votes[key] = Math.max(votes[key] || 0, count);
-                    }
-                });
+    // Strategy 3: regex scan on full page text near metric labels
+    if (Object.keys(votes).filter(k => votes[k] > 0).length === 0) {
+        const fullText = $('body').text().toLowerCase();
+        for (const [label, key] of Object.entries(labelMap)) {
+            const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const re = new RegExp(escaped + '[\\s\\S]{0,100}?([0-9][0-9,]*)', 'i');
+            const m = fullText.match(re);
+            if (m) {
+                const n = parseInt(m[1].replace(/,/g, ''), 10);
+                if (!isNaN(n) && n >= 0) votes[key] = Math.max(votes[key] || 0, n);
             }
-        });
+        }
     }
 
     if (Object.keys(votes).length === 0) return null;
 
-    // Find dominant (most voted)
+    // If we only have labels with 0 counts (no actual vote data), return null
+    const hasRealVotes = Object.values(votes).some(v => v > 0);
+    if (!hasRealVotes) return null;
+
     const sortedEntries = Object.entries(votes).sort((a, b) => b[1] - a[1]);
     const dominant = sortedEntries[0][0];
     const maxVotes = sortedEntries[0][1];
@@ -761,8 +771,8 @@ function extractSeasonUsage($) {
         return isNaN(n) ? 0 : n;
     };
 
-    // Strategy 1: vote-button elements with season/time in class or text
-    $('[class*="vote-button"], [class*="season"], [class*="accord-season"]').each((_, el) => {
+    // Strategy 1: vote-button/season elements with class or text matching keywords
+    $('[class*="vote"], [class*="season"], [class*="accord"], [class*="bar"], [class*="chart"]').each((_, el) => {
         const $el = $(el);
         const cls = ($el.attr('class') || '').toLowerCase();
         const txt = $el.text().toLowerCase();
@@ -778,23 +788,51 @@ function extractSeasonUsage($) {
         }
     });
 
-    // Strategy 2: look for any element whose direct text is a season keyword,
-    // then find adjacent numeric text
-    if (!found) {
-        $('span, div, p, td, li').each((_, el) => {
-            const $el = $(el);
-            const own = $el.clone().children().remove().end().text().trim().toLowerCase();
-            const key = keyMap[own];
-            if (!key) return;
+    // Strategy 2: scan ALL elements whose own text is a season/time keyword,
+    // then look for adjacent numeric values
+    $('span, div, p, td, li, b, strong, label').each((_, el) => {
+        const $el = $(el);
+        const own = $el.clone().children().remove().end().text().trim().toLowerCase();
+        const key = keyMap[own];
+        if (!key) return;
 
-            // look for numeric value in parent or siblings
-            [$el.next(), $el.prev(), $el.parent().children()].forEach($candidates => {
-                $candidates.each((__, c) => {
-                    const n = parseVotes($(c).text());
-                    if (n > 0) { result[key] = Math.max(result[key], n); found = true; }
-                });
+        // Look for numeric value in siblings, parent siblings, parent children
+        const candidates = [
+            $el.next(),
+            $el.prev(),
+            $el.parent().children().not($el[0]),
+            $el.parent().next(),
+            $el.parent().prev(),
+            $el.closest('[class*="vote"], [class*="bar"], [class*="chart"], [class*="season"]').find('[class*="count"], [class*="num"], [class*="score"]'),
+        ];
+        for (const $c of candidates) {
+            let foundCount = null;
+            $c.each((__, c) => {
+                if (foundCount !== null) return;
+                const txt = $(c).text().trim();
+                const n = parseVotes(txt);
+                if (n > 0 && txt.length < 10) foundCount = n;
             });
-        });
+            if (foundCount !== null) {
+                result[key] = Math.max(result[key], foundCount);
+                found = true;
+                break;
+            }
+        }
+    });
+
+    // Strategy 3: regex scan on full text for each season keyword → digits
+    if (!found) {
+        const fullText = $('body').text().toLowerCase();
+        for (const [kw, key] of Object.entries(keyMap)) {
+            const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const re = new RegExp(escaped + '[\\s\\S]{0,80}?([0-9][0-9,.]*k?)', 'i');
+            const m = fullText.match(re);
+            if (m) {
+                const n = parseVotes(m[1]);
+                if (n > 0) { result[key] = Math.max(result[key], n); found = true; }
+            }
+        }
     }
 
     if (!found) return null;
