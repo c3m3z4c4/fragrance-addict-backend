@@ -938,6 +938,33 @@ router.post('/rescrape/queue', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
+// POST /api/scrape/rescrape/queue/ids - Add specific perfume IDs to scraping queue
+router.post('/rescrape/queue/ids', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { ids } = req.body;
+        if (!ids || !Array.isArray(ids) || ids.length === 0) {
+            return next(new ApiError('ids array is required', 400));
+        }
+        if (ids.length > 2000) {
+            return next(new ApiError('Maximum 2000 IDs per request', 400));
+        }
+
+        // Fetch source URLs for the given IDs
+        const perfumes = await dataStore.getByIds(ids);
+        const urlsToAdd = perfumes.filter((p) => p.sourceUrl).map((p) => p.sourceUrl);
+
+        if (urlsToAdd.length === 0) {
+            return res.json({ success: true, added: 0, queueSize: 0, message: 'No valid source URLs found for selected perfumes' });
+        }
+
+        const added = await enqueueUrls(urlsToAdd, true, true);
+        const stats = await dataStore.queueStats().catch(() => ({}));
+        res.json({ success: true, added, queueSize: stats.pending ?? added, total: ids.length });
+    } catch (error) {
+        next(new ApiError(error.message, 500));
+    }
+});
+
 // POST /api/scrape/reset - Wipe ALL perfumes and brands (requires confirmation)
 router.post('/reset', requireSuperAdmin, async (req, res, next) => {
     try {

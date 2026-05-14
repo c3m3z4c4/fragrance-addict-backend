@@ -683,6 +683,20 @@ export const dataStore = {
         return result.rows.map(toCamelCase);
     },
 
+    // Fetch multiple perfumes by ID array
+    getByIds: async (ids) => {
+        if (!isDatabaseConnected) {
+            return memoryStore.filter((p) => ids.includes(p.id));
+        }
+        if (!ids || ids.length === 0) return [];
+        const placeholders = ids.map((_, i) => `$${i + 1}`).join(', ');
+        const result = await pool.query(
+            `SELECT id, source_url FROM perfumes WHERE id IN (${placeholders})`,
+            ids
+        );
+        return result.rows.map(toCamelCase);
+    },
+
     // Export all perfumes (optionally filtered by brand) for backup
     exportAll: async ({ brand } = {}) => {
         if (!isDatabaseConnected) {
