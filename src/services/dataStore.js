@@ -557,19 +557,34 @@ export const dataStore = {
     queueEnqueue: async (urls, force = false) => {
         if (!isDatabaseConnected || !urls.length) return 0;
         if (force) {
-            // Re-scrape mode: reset existing entries to pending+force, add new ones
-            const values = urls.map((_, i) => `($${i + 1})`).join(', ');
+            // Re-scrape mode: reset 'done'/'failed' entries to pending; skip already pending/processing
+            // This prevents re-queueing items that are already in progress or waiting
             const result = await pool.query(
                 `INSERT INTO scrape_queue (url, force) VALUES ${urls.map((_, i) => `($${i + 1}, TRUE)`).join(', ')}
                  ON CONFLICT (url) DO UPDATE
-                   SET status = 'pending', force = TRUE, error_msg = NULL, retry_count = 0, updated_at = NOW()`,
+                   SET status = CASE
+                         WHEN scrape_queue.status IN ('pending', 'processing') THEN scrape_queue.status
+                         ELSE 'pending'
+                       END,
+                       force = TRUE,
+                       error_msg = CASE
+                         WHEN scrape_queue.status IN ('pending', 'processing') THEN scrape_queue.error_msg
+                         ELSE NULL
+                       END,
+                       retry_count = 0,
+                       updated_at = NOW()`,
                 urls
             );
             return result.rowCount;
         } else {
+            // Normal mode: skip URLs already in queue OR already scraped in perfumes table
             const values = urls.map((_, i) => `($${i + 1})`).join(', ');
             const result = await pool.query(
-                `INSERT INTO scrape_queue (url) VALUES ${values} ON CONFLICT (url) DO NOTHING`,
+                `INSERT INTO scrape_queue (url)
+                 SELECT v.url FROM (VALUES ${values}) AS v(url)
+                 WHERE NOT EXISTS (SELECT 1 FROM scrape_queue sq WHERE sq.url = v.url)
+                   AND NOT EXISTS (SELECT 1 FROM perfumes p WHERE p.source_url = v.url)
+                 ON CONFLICT (url) DO NOTHING`,
                 urls
             );
             return result.rowCount;
@@ -629,6 +644,18 @@ export const dataStore = {
             [url]
         );
         return result.rows.length > 0;
+    },
+
+    // Get a perfume by its source URL (returns the full record including id)
+    getBySourceUrl: async (url) => {
+        if (!isDatabaseConnected) {
+            return memoryStore.find(p => p.sourceUrl === url) || null;
+        }
+        const result = await pool.query(
+            'SELECT * FROM perfumes WHERE source_url = $1 LIMIT 1',
+            [url]
+        );
+        return result.rows.length > 0 ? toCamelCase(result.rows[0]) : null;
     },
 
     // Get queue stats grouped by status

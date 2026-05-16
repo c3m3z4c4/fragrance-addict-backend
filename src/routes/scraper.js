@@ -713,9 +713,21 @@ async function processQueue() {
             const perfume = await scrapePerfume(url);
 
             if (perfume) {
-                await dataStore.add(perfume);
+                // Re-scrape mode: update existing record rather than inserting a duplicate
+                if (force) {
+                    const existing = await dataStore.getBySourceUrl(url).catch(() => null);
+                    if (existing) {
+                        await dataStore.update(existing.id, perfume);
+                        console.log(`🔄 Updated: ${perfume.name}`);
+                    } else {
+                        await dataStore.add(perfume);
+                        console.log(`✅ Saved (new): ${perfume.name}`);
+                    }
+                } else {
+                    await dataStore.add(perfume);
+                    console.log(`✅ Saved: ${perfume.name}`);
+                }
                 await dataStore.queueMark(url, 'done');
-                console.log(`✅ Saved: ${perfume.name}`);
             } else {
                 // scrapePerfume returned null/undefined (no data)
                 await dataStore.queueMark(url, 'failed', 'No data returned by scraper');
@@ -832,12 +844,20 @@ router.post('/rescrape/brand', requireSuperAdmin, async (req, res, next) => {
             return res.json({ success: true, processed: results.length, failed: errors.length, results, errors });
         }
 
-        // Queue mode — re-scrape with force=true so existsBySourceUrl check is bypassed
+        // Queue mode — force=true resets done/failed entries; already-pending/processing stay untouched
         const urls = brandPerfumes.map(p => p.sourceUrl).filter(Boolean);
         const added = await enqueueUrls(urls, true, true); // force=true
+        const alreadyQueued = urls.length - added;
 
         const stats = await dataStore.queueStats().catch(() => ({}));
-        res.json({ success: true, added, queueSize: stats.pending ?? added, autoStarted: true });
+        res.json({
+            success: true,
+            added,
+            alreadyQueued,
+            total: urls.length,
+            queueSize: stats.pending ?? added,
+            autoStarted: true,
+        });
     } catch (error) {
         next(new ApiError(error.message, 500));
     }
