@@ -8,13 +8,13 @@ const router = Router();
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 const ALLOWED_MODELS = [
-    'gemini-2.0-flash',
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite-preview-06-17',
     'gemini-2.0-flash-lite',
     'gemini-1.5-flash',
     'gemini-1.5-pro',
-    'gemini-2.5-flash',
 ];
-const DEFAULT_MODEL = 'gemini-2.0-flash';
+const DEFAULT_MODEL = 'gemini-2.5-flash';
 
 /** Runtime-configurable default model (set by admin, resets on restart) */
 let configuredDefaultModel = process.env.AI_DEFAULT_MODEL || DEFAULT_MODEL;
@@ -167,8 +167,13 @@ ${catalogBlock}`;
 
         if (!geminiRes.ok) {
             const errText = await geminiRes.text();
-            console.error(`❌ Gemini API error (model: ${model}):`, errText);
-            return next(new ApiError(`Gemini API request failed (model: ${model})`, 502));
+            console.error(`❌ Gemini API error (${geminiRes.status}, model: ${model}):`, errText);
+            const hint = geminiRes.status === 404
+                ? `Model "${model}" not found or deprecated`
+                : geminiRes.status === 429
+                ? 'Quota exceeded — try again later'
+                : `Gemini API error ${geminiRes.status}`;
+            return next(new ApiError(hint, 502));
         }
 
         const geminiData = await geminiRes.json();
