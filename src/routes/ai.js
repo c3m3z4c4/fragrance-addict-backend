@@ -141,14 +141,14 @@ router.post('/recommendations', requireAuth, async (req, res, next) => {
 
         const profileBlock = buildProfileBlock(profile);
 
-        const prompt = `You are an expert perfume sommelier for a fragrance catalog app. Your task is to recommend exactly 5 perfumes the user would love.
+        const prompt = `You are an expert perfume sommelier. Recommend exactly 5 perfumes this user would love.
 
-INSTRUCTIONS:
-- Prioritize perfumes from the catalog list provided below
-- Do NOT recommend any perfume already in the user's favourites list
-- Tailor recommendations to the user profile (age, gender, occasions, seasons, intensity)
-- For each suggestion: name, brand, one-sentence reason tailored to this specific user, and 2-3 key notes/accords
-- Respond ONLY with raw JSON, no markdown fences: {"recommendations":[{"name":"...","brand":"...","reason":"...","keyNotes":["...","..."]}]}
+RULES:
+- Always return exactly 5 recommendations, no exceptions
+- Never recommend a perfume already in the user's favourites list
+- Prioritize perfumes from the catalog if one is provided; supplement with well-known fragrances if needed
+- Tailor each recommendation to the user's profile (age, gender, occasions, seasons, intensity)
+- Each entry must have: name, brand, a one-sentence personalized reason, and 2-3 key notes/accords
 
 ${favoritesBlock}
 ${profileBlock ? `\n${profileBlock}` : ''}
@@ -161,7 +161,30 @@ ${catalogBlock}`;
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.85, maxOutputTokens: 2048 },
+                generationConfig: {
+                    temperature: 0.85,
+                    maxOutputTokens: 2048,
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: 'object',
+                        properties: {
+                            recommendations: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        name:     { type: 'string' },
+                                        brand:    { type: 'string' },
+                                        reason:   { type: 'string' },
+                                        keyNotes: { type: 'array', items: { type: 'string' } },
+                                    },
+                                    required: ['name', 'brand', 'reason', 'keyNotes'],
+                                },
+                            },
+                        },
+                        required: ['recommendations'],
+                    },
+                },
             }),
         });
 
@@ -188,7 +211,7 @@ ${catalogBlock}`;
         try {
             recommendations = JSON.parse(rawText).recommendations || [];
         } catch {
-            // Gemini sometimes wraps JSON in markdown fences
+            // Fallback: strip markdown fences if present
             const match = rawText.match(/```(?:json)?\s*([\s\S]*?)```/) || rawText.match(/(\{[\s\S]*\})/);
             try {
                 const jsonStr = match?.[1] ?? match?.[0] ?? '{}';
