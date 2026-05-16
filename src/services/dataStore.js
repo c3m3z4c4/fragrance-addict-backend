@@ -280,6 +280,13 @@ export const initDatabase = async () => {
     CREATE INDEX IF NOT EXISTS idx_activity_session_id ON activity_events(session_id);
     CREATE INDEX IF NOT EXISTS idx_activity_event_type ON activity_events(event_type);
     CREATE INDEX IF NOT EXISTS idx_activity_created_at ON activity_events(created_at DESC);
+
+    -- ===== BACKUP CONFIG TABLE =====
+    CREATE TABLE IF NOT EXISTS backup_config (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      config JSONB DEFAULT '{}',
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
   `;
 
     try {
@@ -1620,5 +1627,45 @@ export const dataStore = {
             console.error('❌ getBrandLogos:', err.message);
             return [];
         }
+    },
+
+    // ===== BACKUP CONFIG METHODS =====
+
+    getBackupConfig: async () => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                'SELECT config FROM backup_config WHERE id = 1'
+            );
+            return result.rows[0]?.config || null;
+        } catch {
+            return null;
+        }
+    },
+
+    saveBackupConfig: async (config) => {
+        if (!isDatabaseConnected) return;
+        await pool.query(
+            `INSERT INTO backup_config (id, config, updated_at) VALUES (1, $1, NOW())
+             ON CONFLICT (id) DO UPDATE SET config = $1, updated_at = NOW()`,
+            [JSON.stringify(config)]
+        );
+    },
+
+    updateBackupTimestamp: async () => {
+        if (!isDatabaseConnected) return;
+        try {
+            const existing = await pool.query(
+                'SELECT config FROM backup_config WHERE id = 1'
+            );
+            if (existing.rows[0]) {
+                const config = existing.rows[0].config || {};
+                config.lastBackupAt = new Date().toISOString();
+                await pool.query(
+                    'UPDATE backup_config SET config = $1, updated_at = NOW() WHERE id = 1',
+                    [JSON.stringify(config)]
+                );
+            }
+        } catch {}
     },
 };

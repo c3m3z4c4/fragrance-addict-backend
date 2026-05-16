@@ -17,6 +17,7 @@ import contentRoutes from './routes/content.js';
 import aiRoutes from './routes/ai.js';
 import activityRoutes from './routes/activity.js';
 import backupRoutes from './routes/backup.js';
+import { initScheduler } from './services/backupScheduler.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { initDatabase, dataStore, getConnectionError } from './services/dataStore.js';
 import { requireSuperAdmin } from './middleware/auth.js';
@@ -153,6 +154,9 @@ const startServer = async () => {
     console.error('⚠️ Database initialization failed:', error.message);
     console.log('🔄 Server will start anyway with in-memory storage');
   }
+
+  // Initialize backup scheduler (reads config from DB, harmless if DB unavailable)
+  await initScheduler();
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Server running on port ${PORT}`);
