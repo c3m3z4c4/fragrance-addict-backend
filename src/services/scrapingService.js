@@ -35,6 +35,37 @@ export const BROWSER_CONFIG = {
 // Keep local alias for backward-compat within this file
 const getBrowserConfig = () => BROWSER_CONFIG;
 
+// Inject stealth scripts to evade headless browser detection (Cloudflare, etc.)
+export async function addStealthScripts(page) {
+    await page.evaluateOnNewDocument(() => {
+        // Hide webdriver flag
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        // Fake plugins array
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                const arr = [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }];
+                arr.__proto__ = PluginArray.prototype;
+                return arr;
+            },
+        });
+        // Fake languages
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        // Fake platform
+        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        // Fake chrome runtime
+        if (!window.chrome) window.chrome = {};
+        if (!window.chrome.runtime) window.chrome.runtime = {};
+        // Fix permissions query for notifications
+        if (navigator.permissions?.query) {
+            const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+            navigator.permissions.query = (params) =>
+                params.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission, onchange: null })
+                    : originalQuery(params);
+        }
+    });
+}
+
 // Scraper con Puppeteer para Fragrantica.com
 export const scrapePerfume = async (url) => {
     // Verificar caché
@@ -54,30 +85,38 @@ export const scrapePerfume = async (url) => {
         browser = await puppeteer.launch(getBrowserConfig());
         const page = await browser.newPage();
 
+        // Inject stealth scripts before any navigation
+        await addStealthScripts(page);
+
         // Configurar viewport y user agent
-        await page.setViewport({ width: 1920, height: 1080 });
+        await page.setViewport({ width: 1280, height: 800 });
         await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         );
 
         // Configurar headers adicionales
         await page.setExtraHTTPHeaders({
             'Accept-Language': 'en-US,en;q=0.9',
             Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Upgrade-Insecure-Requests': '1',
         });
 
-        // Navegar a la página
+        // Navegar a la página — use domcontentloaded to avoid networkidle2 timeout
+        // (Fragrantica has background analytics/polling that prevents networkidle2 from ever firing)
         console.log('📄 Navegando a:', url);
         await page.goto(url, {
-            waitUntil: 'networkidle2',
+            waitUntil: 'domcontentloaded',
             timeout: 60000,
         });
 
         // Esperar a que cargue el contenido principal
-        await page.waitForSelector('h1', { timeout: 30000 });
+        await page.waitForSelector('h1', { timeout: 15000 });
+
+        // Give JS 2s to render dynamic content after DOM is ready
+        await new Promise(r => setTimeout(r, 2000));
 
         // Also wait for the notes pyramid if present (it lazy-loads on some pages)
-        await page.waitForSelector('#pyramid, [class*="pyramid"], a[href*="/notes/"]', { timeout: 10000 }).catch(() => {});
+        await page.waitForSelector('#pyramid, [class*="pyramid"], a[href*="/notes/"]', { timeout: 8000 }).catch(() => {});
 
         // Scroll down to trigger lazy-loaded vote widgets
         await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));

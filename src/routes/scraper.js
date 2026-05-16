@@ -1,7 +1,7 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
-import { scrapePerfume, BROWSER_CONFIG } from '../services/scrapingService.js';
+import { scrapePerfume, BROWSER_CONFIG, addStealthScripts } from '../services/scrapingService.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
@@ -1134,48 +1134,141 @@ router.delete('/duplicates', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
+// ─── Brand logo fetch job tracker (in-memory) ────────────────────────────────
+let logoFetchJob = {
+    running: false,
+    total: 0,
+    processed: 0,
+    updated: 0,
+    failed: 0,
+    results: [],
+    startedAt: null,
+    completedAt: null,
+};
+
 // ─── POST /api/scrape/brands/logos ───────────────────────────────────────────
-// Fetch brand logos from multiple free sources for all brands in DB.
-// Sources tried in order: Wikipedia API, Logo.dev (if key set), Brandfetch (if key set).
+// Fetch brand logos from Fragrantica brand pages (most reliable source for fragrance brands).
+// Starts a background job and returns immediately; poll GET /brands/logos/status for progress.
 
 router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
     try {
+        if (logoFetchJob.running) {
+            return res.json({ success: true, status: 'already_running', job: logoFetchJob });
+        }
+
         const brandsResult = await dataStore.getBrands();
-        // Only process brands that do not already have a logo_url set
         const brandsToProcess = brandsResult.filter(b => b.name && !b.logo_url);
-        const brandNames = brandsToProcess.map(b => b.name);
 
-        if (brandNames.length === 0) {
-            return res.json({ success: true, total: 0, updated: 0, failed: 0, results: [], message: 'All brands already have logos.' });
+        if (brandsToProcess.length === 0) {
+            return res.json({ success: true, status: 'done', total: 0, updated: 0, failed: 0, results: [], message: 'All brands already have logos.' });
         }
 
-        const results = [];
-        let updated = 0;
-        let failed = 0;
+        // Reset job state and start
+        logoFetchJob = {
+            running: true,
+            total: brandsToProcess.length,
+            processed: 0,
+            updated: 0,
+            failed: 0,
+            results: [],
+            startedAt: new Date().toISOString(),
+            completedAt: null,
+        };
 
-        for (const name of brandNames) {
+        // Respond immediately so the client can start polling
+        res.json({ success: true, status: 'started', total: brandsToProcess.length });
+
+        // Background processing — single browser instance for all brands
+        setImmediate(async () => {
+            const puppeteer = (await import('puppeteer')).default;
+            let browser = null;
             try {
-                const logoUrl = await fetchBrandLogo(name);
-                if (logoUrl) {
-                    await dataStore.upsertBrand(name, logoUrl, null);
-                    results.push({ name, logoUrl, status: 'updated' });
-                    updated++;
-                } else {
-                    results.push({ name, logoUrl: null, status: 'not_found' });
-                    failed++;
-                }
-                await new Promise(r => setTimeout(r, 150));
-            } catch (err) {
-                results.push({ name, logoUrl: null, status: 'error', error: err.message });
-                failed++;
-            }
-        }
+                browser = await puppeteer.launch(BROWSER_CONFIG);
 
-        res.json({ success: true, total: brandNames.length, updated, failed, results });
+                for (const brand of brandsToProcess) {
+                    if (!logoFetchJob.running) break;
+                    try {
+                        const logoUrl = await fetchBrandLogoFromFragrantica(browser, brand.name);
+                        if (logoUrl) {
+                            await dataStore.upsertBrand(brand.name, logoUrl, null);
+                            logoFetchJob.results.push({ name: brand.name, logoUrl, status: 'updated' });
+                            logoFetchJob.updated++;
+                            console.log(`🖼️  Logo saved for "${brand.name}"`);
+                        } else {
+                            logoFetchJob.results.push({ name: brand.name, logoUrl: null, status: 'not_found' });
+                            logoFetchJob.failed++;
+                        }
+                    } catch (err) {
+                        logoFetchJob.results.push({ name: brand.name, logoUrl: null, status: 'error', error: err.message });
+                        logoFetchJob.failed++;
+                        console.warn(`⚠️  Logo error for "${brand.name}": ${err.message}`);
+                    }
+                    logoFetchJob.processed++;
+                    await new Promise(r => setTimeout(r, 800));
+                }
+            } catch (err) {
+                console.error('Logo fetch job crashed:', err.message);
+            } finally {
+                if (browser) await browser.close().catch(() => {});
+                logoFetchJob.running = false;
+                logoFetchJob.completedAt = new Date().toISOString();
+                console.log(`✅ Logo fetch done: ${logoFetchJob.updated} updated, ${logoFetchJob.failed} not found`);
+            }
+        });
     } catch (err) {
         next(err);
     }
 });
+
+// GET /api/scrape/brands/logos/status — poll progress of the background logo fetch job
+router.get('/brands/logos/status', requireSuperAdmin, (req, res) => {
+    res.json({ success: true, ...logoFetchJob });
+});
+
+// Helper: extract brand logo from a Fragrantica designer page using an existing browser instance
+async function fetchBrandLogoFromFragrantica(browser, brandName) {
+    const page = await browser.newPage();
+    try {
+        await addStealthScripts(page);
+        await page.setUserAgent(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        );
+
+        const brandSlug = brandName.trim()
+            .replace(/\s+/g, '-')
+            .replace(/['']/g, '')
+            .replace(/&/g, 'and');
+
+        await page.goto(`https://www.fragrantica.com/designers/${brandSlug}.html`, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+        });
+
+        // Wait briefly for images to finish loading
+        await new Promise(r => setTimeout(r, 1500));
+
+        const logoUrl = await page.evaluate(() => {
+            const selectors = [
+                'img[src*="/dizajneri/"]',
+                'img[src*="fimgs.net"][src*="/mdimg/"]',
+                '.brand-header img',
+                'header img',
+                '#main-content img',
+            ];
+            for (const sel of selectors) {
+                const img = document.querySelector(sel);
+                if (img?.src && img.naturalWidth > 50) return img.src;
+            }
+            // Last resort: first fimgs.net image (Fragrantica CDN)
+            const anyFimgs = document.querySelector('img[src*="fimgs.net"]');
+            return anyFimgs?.src || null;
+        }).catch(() => null);
+
+        return logoUrl;
+    } finally {
+        await page.close().catch(() => {});
+    }
+}
 
 // GET /api/scrape/brands/without-logos — list of brand names with no logo in DB
 router.get('/brands/without-logos', requireSuperAdmin, async (req, res, next) => {
@@ -1191,115 +1284,6 @@ router.get('/brands/without-logos', requireSuperAdmin, async (req, res, next) =>
     }
 });
 
-// ─── Multi-source brand logo resolver ────────────────────────────────────────
-
-async function fetchBrandLogo(brandName) {
-    // Source 1: Wikipedia REST API (free, no key needed)
-    const wikiLogo = await fetchWikipediaLogo(brandName);
-    if (wikiLogo) return wikiLogo;
-
-    // Source 2: Logo.dev (requires LOGO_DEV_KEY env var — free signup at logo.dev)
-    const logoDevKey = process.env.LOGO_DEV_KEY;
-    if (logoDevKey) {
-        const logoDevUrl = await fetchLogoDevLogo(brandName, logoDevKey);
-        if (logoDevUrl) return logoDevUrl;
-    }
-
-    // Source 3: Brandfetch (requires BRANDFETCH_KEY env var — free signup at brandfetch.io)
-    const brandfetchKey = process.env.BRANDFETCH_KEY;
-    if (brandfetchKey) {
-        const brandfetchUrl = await fetchBrandfetchLogo(brandName, brandfetchKey);
-        if (brandfetchUrl) return brandfetchUrl;
-    }
-
-    return null;
-}
-
-// Wikipedia REST API: STRICT logo-only — only accept SVG files or URLs explicitly containing "logo".
-// Rejects article thumbnails (portraits, product photos, etc.) that Wikipedia uses for people/brands.
-async function fetchWikipediaLogo(brandName) {
-    try {
-        const { default: axios } = await import('axios');
-
-        // Use the MediaWiki API to search for an explicit logo file on Wikimedia Commons
-        const searchQuery = encodeURIComponent(`${brandName} logo`);
-        const searchRes = await axios.get(
-            `https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch=${searchQuery}&srnamespace=6&srlimit=5&format=json`,
-            { timeout: 6000, headers: { 'User-Agent': 'FragranceAddict/1.0 (brand-logo-fetcher)' } }
-        ).catch(() => null);
-
-        if (searchRes?.data?.query?.search?.length > 0) {
-            const normalized = brandName.toLowerCase().replace(/[^a-z0-9]/g, '');
-            for (const hit of searchRes.data.query.search) {
-                const title = (hit.title || '').toLowerCase();
-                const hitNorm = title.replace(/[^a-z0-9]/g, '');
-                // Must contain the brand name and "logo" in the file title
-                if (!title.includes('logo')) continue;
-                if (!hitNorm.includes(normalized) && !normalized.includes(hitNorm.replace('logo', '').trim())) continue;
-
-                // Get the actual image URL from Commons
-                const fileTitle = encodeURIComponent(hit.title);
-                const infoRes = await axios.get(
-                    `https://commons.wikimedia.org/w/api.php?action=query&titles=${fileTitle}&prop=imageinfo&iiprop=url&format=json`,
-                    { timeout: 5000, headers: { 'User-Agent': 'FragranceAddict/1.0 (brand-logo-fetcher)' } }
-                ).catch(() => null);
-
-                const pages = infoRes?.data?.query?.pages || {};
-                const page = Object.values(pages)[0];
-                const imgUrl = page?.imageinfo?.[0]?.url;
-                if (imgUrl) return imgUrl;
-            }
-        }
-
-        return null;
-    } catch {
-        return null;
-    }
-}
-
-// Logo.dev: Clearbit drop-in replacement, 10k/month free with API key
-async function fetchLogoDevLogo(brandName, apiKey) {
-    try {
-        const { default: axios } = await import('axios');
-        // Logo.dev works by domain — guess the most likely domain
-        const slug = brandName.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const domains = [`${slug}.com`, `${slug}.fr`, `${slug}.co.uk`];
-
-        for (const domain of domains) {
-            const url = `https://img.logo.dev/${domain}?token=${apiKey}&format=png&size=128`;
-            const check = await axios.head(url, { timeout: 4000 }).catch(() => null);
-            if (check && check.status === 200) return url;
-        }
-        return null;
-    } catch {
-        return null;
-    }
-}
-
-// Brandfetch: 500k/month free with API key
-async function fetchBrandfetchLogo(brandName, apiKey) {
-    try {
-        const { default: axios } = await import('axios');
-        const slug = brandName.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const domain = `${slug}.com`;
-
-        const res = await axios.get(`https://api.brandfetch.io/v2/brands/${domain}`, {
-            timeout: 6000,
-            headers: { Authorization: `Bearer ${apiKey}` },
-        }).catch(() => null);
-
-        if (!res || res.status !== 200) return null;
-        const logos = res.data?.logos;
-        if (!Array.isArray(logos) || logos.length === 0) return null;
-
-        // Prefer SVG logo, fall back to PNG
-        const svg = logos.flatMap(l => l.formats || []).find(f => f.format === 'svg');
-        const png = logos.flatMap(l => l.formats || []).find(f => f.format === 'png');
-        return svg?.src || png?.src || null;
-    } catch {
-        return null;
-    }
-}
 
 // ─── Logo upload: single brand ───────────────────────────────────────────────
 // POST /api/scrape/brands/logo/upload
