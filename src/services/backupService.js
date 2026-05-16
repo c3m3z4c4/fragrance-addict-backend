@@ -193,7 +193,8 @@ export async function uploadToDestinations(buffer, filename, destinations = []) 
                 remotePath = await uploadWebDAV(buffer, filename, decryptedConfig);
             } else if (dest.type === 'gdrive') {
                 remotePath = await uploadGoogleDrive(buffer, filename, decryptedConfig);
-            } else if (dest.type === 'sftp') {
+            } else if (dest.type === 'sftp' || dest.type === 'tailscale') {
+                // Tailscale is a transparent VPN layer — standard SFTP works over it
                 remotePath = await uploadSFTP(buffer, filename, decryptedConfig);
             }
             results.push({ id: dest.id, name: dest.name, type: dest.type, success: true, remotePath });

@@ -217,13 +217,15 @@ router.post('/test-destination', requireSuperAdmin, async (req, res, next) => {
             await uploadWebDAV(testBuffer, testFilename, config);
         } else if (type === 'gdrive') {
             await uploadGoogleDrive(testBuffer, testFilename, config);
-        } else if (type === 'sftp') {
+        } else if (type === 'sftp' || type === 'tailscale') {
+            // Tailscale is transparent VPN — test as standard SFTP
             await uploadSFTP(testBuffer, testFilename, config);
         } else {
             return res.status(400).json({ success: false, error: 'Unknown destination type' });
         }
 
-        res.json({ success: true, message: `Conexión a ${type} exitosa` });
+        const label = type === 'tailscale' ? 'Tailscale (SFTP)' : type;
+        res.json({ success: true, message: `Conexión a ${label} exitosa` });
     } catch (err) {
         res.json({ success: false, error: err.message });
     }
