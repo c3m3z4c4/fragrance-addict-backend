@@ -265,6 +265,15 @@ export const initDatabase = async () => {
       END IF;
     END $$;
 
+    -- Migration: deduplicate brands table (keep row with logo_url, or earliest created)
+    DO $$ BEGIN
+      DELETE FROM brands b1
+      USING brands b2
+      WHERE LOWER(b1.name) = LOWER(b2.name)
+        AND b1.id > b2.id
+        AND (b1.logo_url IS NULL OR b2.logo_url IS NOT NULL);
+    END $$;
+
     -- ===== ACTIVITY EVENTS TABLE =====
     CREATE TABLE IF NOT EXISTS activity_events (
       id BIGSERIAL PRIMARY KEY,
@@ -747,26 +756,37 @@ export const dataStore = {
     // Obtener todas las marcas con imagen representativa y conteo
     getBrands: async () => {
         if (!isDatabaseConnected) {
-            const brandNames = [...new Set(memoryStore.map((p) => p.brand).filter(Boolean))].sort();
-            return brandNames.map((name) => {
-                const brandPerfumes = memoryStore.filter((p) => p.brand === name);
+            const brandNames = [...new Set(memoryStore.map((p) => p.brand?.toLowerCase()).filter(Boolean))].sort();
+            return brandNames.map((key) => {
+                const brandPerfumes = memoryStore.filter((p) => p.brand?.toLowerCase() === key);
                 const withImage = brandPerfumes.find((p) => p.image_url);
-                return { name, count: brandPerfumes.length, imageUrl: withImage?.image_url || null };
+                return { name: brandPerfumes[0].brand, count: brandPerfumes.length, imageUrl: withImage?.image_url || null };
             });
         }
+        // Group by LOWER(brand) to merge case-insensitive duplicates (e.g. "Chanel" + "CHANEL")
         const result = await pool.query(`
+            WITH brand_groups AS (
+                SELECT
+                    LOWER(brand) AS brand_key,
+                    MIN(brand)   AS canonical_name,
+                    COUNT(*)     AS total
+                FROM perfumes
+                WHERE brand IS NOT NULL
+                GROUP BY LOWER(brand)
+            )
             SELECT
-                p.brand AS name,
-                COUNT(*) AS count,
+                bg.canonical_name AS name,
+                bg.total AS count,
                 COALESCE(
-                    b.logo_url,
-                    (SELECT image_url FROM perfumes p2 WHERE p2.brand = p.brand AND p2.image_url IS NOT NULL AND p2.image_url != '' ORDER BY p2.rating DESC NULLS LAST LIMIT 1)
+                    (SELECT b.logo_url FROM brands b
+                     WHERE LOWER(b.name) = bg.brand_key AND b.logo_url IS NOT NULL
+                     ORDER BY b.scraped_at DESC NULLS LAST LIMIT 1),
+                    (SELECT p.image_url FROM perfumes p
+                     WHERE LOWER(p.brand) = bg.brand_key AND p.image_url IS NOT NULL AND p.image_url != ''
+                     ORDER BY p.rating DESC NULLS LAST LIMIT 1)
                 ) AS image_url
-            FROM perfumes p
-            LEFT JOIN brands b ON LOWER(b.name) = LOWER(p.brand)
-            WHERE p.brand IS NOT NULL
-            GROUP BY p.brand, b.logo_url
-            ORDER BY p.brand
+            FROM brand_groups bg
+            ORDER BY bg.canonical_name
         `);
         return result.rows.map((row) => ({
             name: row.name,
@@ -1596,13 +1616,24 @@ export const dataStore = {
 
     // ===== BRAND LOGO METHODS =====
 
-    // Upsert a brand with its logo URL
+    // Upsert a brand with its logo URL — case-insensitive: updates existing row if name matches
     upsertBrand: async (name, logoUrl, fragranticaUrl) => {
         if (!isDatabaseConnected) return null;
         try {
-            const result = await pool.query(
-                `INSERT INTO brands (name, logo_url, fragrantica_url)
-                 VALUES ($1, $2, $3)
+            // UPDATE first (matches any casing); if no row exists, INSERT
+            const upd = await pool.query(
+                `UPDATE brands SET
+                    logo_url = COALESCE($2, logo_url),
+                    fragrantica_url = COALESCE($3, fragrantica_url),
+                    scraped_at = NOW()
+                 WHERE LOWER(name) = LOWER($1)
+                 RETURNING *`,
+                [name, logoUrl || null, fragranticaUrl || null]
+            );
+            if (upd.rows[0]) return upd.rows[0];
+            // No existing row → insert
+            const ins = await pool.query(
+                `INSERT INTO brands (name, logo_url, fragrantica_url) VALUES ($1, $2, $3)
                  ON CONFLICT (name) DO UPDATE SET
                    logo_url = COALESCE($2, brands.logo_url),
                    fragrantica_url = COALESCE($3, brands.fragrantica_url),
@@ -1610,39 +1641,46 @@ export const dataStore = {
                  RETURNING *`,
                 [name, logoUrl || null, fragranticaUrl || null]
             );
-            return result.rows[0] || null;
+            return ins.rows[0] || null;
         } catch (err) {
             console.error('❌ upsertBrand:', err.message);
             return null;
         }
     },
 
-    // Force-update a brand's logo URL (always overwrites existing)
+    // Force-update a brand's logo URL (always overwrites existing) — case-insensitive
     setBrandLogo: async (name, logoUrl) => {
         if (!isDatabaseConnected) return null;
         try {
-            const result = await pool.query(
+            const upd = await pool.query(
+                `UPDATE brands SET logo_url = $2, scraped_at = NOW()
+                 WHERE LOWER(name) = LOWER($1) RETURNING *`,
+                [name, logoUrl]
+            );
+            if (upd.rows[0]) return upd.rows[0];
+            const ins = await pool.query(
                 `INSERT INTO brands (name, logo_url)
                  VALUES ($1, $2)
-                 ON CONFLICT (name) DO UPDATE SET
-                   logo_url = $2,
-                   scraped_at = NOW()
+                 ON CONFLICT (name) DO UPDATE SET logo_url = $2, scraped_at = NOW()
                  RETURNING *`,
                 [name, logoUrl]
             );
-            return result.rows[0] || null;
+            return ins.rows[0] || null;
         } catch (err) {
             console.error('❌ setBrandLogo:', err.message);
             return null;
         }
     },
 
-    // Get all stored brand logos
+    // Get all stored brand logos — deduplicated by case-insensitive name
     getBrandLogos: async () => {
         if (!isDatabaseConnected) return [];
         try {
             const result = await pool.query(
-                'SELECT name, logo_url, fragrantica_url, scraped_at FROM brands ORDER BY name'
+                `SELECT DISTINCT ON (LOWER(name))
+                    name, logo_url, fragrantica_url, scraped_at
+                 FROM brands
+                 ORDER BY LOWER(name), (logo_url IS NOT NULL) DESC, scraped_at DESC NULLS LAST`
             );
             return result.rows.map(r => ({
                 name: r.name,
