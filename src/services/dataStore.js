@@ -1884,6 +1884,20 @@ export const dataStore = {
         }
     },
 
+    // Brands that have a logo_url explicitly saved in the brands table (not fallback from perfume images)
+    getBrandsWithSavedLogos: async () => {
+        if (!isDatabaseConnected) return [];
+        try {
+            const result = await pool.query(
+                `SELECT name FROM brands WHERE logo_url IS NOT NULL AND logo_url != ''`
+            );
+            return result.rows.map(r => ({ name: r.name }));
+        } catch (err) {
+            console.error('❌ getBrandsWithSavedLogos:', err.message);
+            return [];
+        }
+    },
+
     // ===== BACKUP CONFIG METHODS =====
 
     getBackupConfig: async () => {

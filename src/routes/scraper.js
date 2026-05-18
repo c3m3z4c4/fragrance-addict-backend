@@ -1176,14 +1176,21 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
             return res.json({ success: true, status: 'already_running', job: logoFetchJob });
         }
 
-        const brandsResult = await dataStore.getBrands();
-        const brandsToProcess = brandsResult.filter(b => b.name && !b.logo_url);
+        const { force = false } = req.body;
+
+        // Query brands table directly to know which ones truly have no logo_url saved
+        const allBrands = await dataStore.getBrands();
+        const brandsWithSavedLogos = await dataStore.getBrandsWithSavedLogos();
+        const savedLogoSet = new Set(brandsWithSavedLogos.map(b => b.name.toLowerCase()));
+
+        const brandsToProcess = force
+            ? allBrands.filter(b => b.name)
+            : allBrands.filter(b => b.name && !savedLogoSet.has(b.name.toLowerCase()));
 
         if (brandsToProcess.length === 0) {
             return res.json({ success: true, status: 'done', total: 0, updated: 0, failed: 0, results: [], message: 'All brands already have logos.' });
         }
 
-        // Reset job state and start
         logoFetchJob = {
             running: true,
             total: brandsToProcess.length,
@@ -1195,10 +1202,8 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
             completedAt: null,
         };
 
-        // Respond immediately so the client can start polling
         res.json({ success: true, status: 'started', total: brandsToProcess.length });
 
-        // Background processing — single browser instance for all brands
         setImmediate(async () => {
             const puppeteer = (await import('puppeteer')).default;
             let browser = null;
@@ -1208,23 +1213,24 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
                 for (const brand of brandsToProcess) {
                     if (!logoFetchJob.running) break;
                     try {
-                        const logoUrl = await fetchBrandLogoFromFragrantica(browser, brand.name);
+                        const { logoUrl, source } = await fetchBrandLogoMultiSource(browser, brand.name);
                         if (logoUrl) {
                             await dataStore.upsertBrand(brand.name, logoUrl, null);
-                            logoFetchJob.results.push({ name: brand.name, logoUrl, status: 'updated' });
+                            logoFetchJob.results.push({ name: brand.name, logoUrl, source, status: 'updated' });
                             logoFetchJob.updated++;
-                            console.log(`🖼️  Logo saved for "${brand.name}"`);
+                            console.log(`🖼️  Logo [${source}] "${brand.name}"`);
                         } else {
-                            logoFetchJob.results.push({ name: brand.name, logoUrl: null, status: 'not_found' });
+                            logoFetchJob.results.push({ name: brand.name, logoUrl: null, source: null, status: 'not_found' });
                             logoFetchJob.failed++;
                         }
                     } catch (err) {
-                        logoFetchJob.results.push({ name: brand.name, logoUrl: null, status: 'error', error: err.message });
+                        logoFetchJob.results.push({ name: brand.name, logoUrl: null, source: null, status: 'error', error: err.message });
                         logoFetchJob.failed++;
-                        console.warn(`⚠️  Logo error for "${brand.name}": ${err.message}`);
+                        console.warn(`⚠️  Logo error "${brand.name}": ${err.message}`);
                     }
                     logoFetchJob.processed++;
-                    await new Promise(r => setTimeout(r, 800));
+                    // Respectful delay between brands
+                    await new Promise(r => setTimeout(r, 1200));
                 }
             } catch (err) {
                 console.error('Logo fetch job crashed:', err.message);
@@ -1245,49 +1251,155 @@ router.get('/brands/logos/status', requireSuperAdmin, (req, res) => {
     res.json({ success: true, ...logoFetchJob });
 });
 
-// Helper: extract brand logo from a Fragrantica designer page using an existing browser instance
-async function fetchBrandLogoFromFragrantica(browser, brandName) {
+// ─── Multi-source brand logo fetcher ─────────────────────────────────────────
+// Tries sources in order: Clearbit → DuckDuckGo → Parfumo → Fragrantica (multiple slugs)
+// Returns { logoUrl, source } or { logoUrl: null, source: null }
+
+async function fetchBrandLogoMultiSource(browser, brandName) {
+    // --- Source 1: Clearbit Logo API (fast, no browser, works for major brands) ---
+    const clearbitUrl = await tryLogoFromClearbit(brandName);
+    if (clearbitUrl) return { logoUrl: clearbitUrl, source: 'clearbit' };
+
+    // --- Source 2: DuckDuckGo Instant Answer (entity image for known brands) ---
+    const ddgUrl = await tryLogoFromDuckDuckGo(brandName);
+    if (ddgUrl) return { logoUrl: ddgUrl, source: 'duckduckgo' };
+
+    // --- Source 3: Parfumo (fragrance-specific, no anti-bot) ---
+    const parfumoUrl = await tryLogoFromParfumo(browser, brandName);
+    if (parfumoUrl) return { logoUrl: parfumoUrl, source: 'parfumo' };
+
+    // --- Source 4: Fragrantica (multiple slug patterns) ---
+    const fragranticaUrl = await tryLogoFromFragrantica(browser, brandName);
+    if (fragranticaUrl) return { logoUrl: fragranticaUrl, source: 'fragrantica' };
+
+    return { logoUrl: null, source: null };
+}
+
+// Generate multiple slug variants to try for a brand name
+function brandSlugs(brandName) {
+    const base = brandName.trim();
+    const slugs = [];
+    // Variant 1: spaces → hyphens, remove apostrophes, & → and
+    slugs.push(base.replace(/\s+/g, '-').replace(/[''']/g, '').replace(/&/g, 'and').replace(/[^\w-]/g, ''));
+    // Variant 2: spaces → underscores
+    slugs.push(base.replace(/\s+/g, '_').replace(/[''']/g, '').replace(/&/g, 'and').replace(/[^\w_]/g, ''));
+    // Variant 3: no separator (compact)
+    slugs.push(base.replace(/\s+/g, '').replace(/[''']/g, '').replace(/&/g, 'and').replace(/[^\w]/g, ''));
+    // Variant 4: URL-encoded original (handles accents)
+    slugs.push(encodeURIComponent(base.replace(/\s+/g, '-')));
+    return [...new Set(slugs)];
+}
+
+// Clearbit Logo API — fast HTTP, no browser needed, excellent for major consumer brands
+async function tryLogoFromClearbit(brandName) {
+    try {
+        const slug = brandName.toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
+        const candidates = [
+            `${slug}.com`,
+            `${brandName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')}.com`,
+            `${brandName.toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '')}.fr`,
+            `${slug}parfums.com`,
+            `parfums${slug}.com`,
+            `maison${slug}.com`,
+        ];
+        for (const domain of candidates) {
+            try {
+                const url = `https://logo.clearbit.com/${domain}?size=200&format=png`;
+                const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+                if (resp.ok) {
+                    const ct = resp.headers.get('content-type') || '';
+                    if (ct.startsWith('image/') && !ct.includes('svg')) return url;
+                }
+            } catch { /* try next */ }
+        }
+    } catch { /* ignore */ }
+    return null;
+}
+
+// DuckDuckGo Instant Answer — entity images for well-known brands
+async function tryLogoFromDuckDuckGo(brandName) {
+    try {
+        const q = encodeURIComponent(`${brandName} perfume brand`);
+        const resp = await fetch(
+            `https://api.duckduckgo.com/?q=${q}&format=json&no_html=1&skip_disambig=1`,
+            { signal: AbortSignal.timeout(6000) }
+        );
+        if (!resp.ok) return null;
+        const data = await resp.json();
+        const img = data.Image || data.RelatedTopics?.[0]?.Icon?.URL || null;
+        if (img && img.startsWith('http') && !img.includes('duckduckgo.com/i/')) return img;
+    } catch { /* ignore */ }
+    return null;
+}
+
+// Parfumo — fragrance-specific site, friendlier to scraping than Fragrantica
+async function tryLogoFromParfumo(browser, brandName) {
     const page = await browser.newPage();
     try {
-        await addStealthScripts(page);
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        );
-
-        const brandSlug = brandName.trim()
-            .replace(/\s+/g, '-')
-            .replace(/['']/g, '')
-            .replace(/&/g, 'and');
-
-        await page.goto(`https://www.fragrantica.com/designers/${brandSlug}.html`, {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000,
+        await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+        const slug = brandName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
+        await page.goto(`https://www.parfumo.com/Perfumes/${slug}`, {
+            waitUntil: 'domcontentloaded', timeout: 20000,
         });
-
-        // Wait briefly for images to finish loading
-        await new Promise(r => setTimeout(r, 1500));
-
+        await new Promise(r => setTimeout(r, 800));
         const logoUrl = await page.evaluate(() => {
             const selectors = [
-                'img[src*="/dizajneri/"]',
-                'img[src*="fimgs.net"][src*="/mdimg/"]',
-                '.brand-header img',
-                'header img',
-                '#main-content img',
+                '.brand-logo img', '.house-logo img',
+                'img[class*="logo"]', 'img[alt*="logo"]',
+                '.brand img', 'header img',
             ];
             for (const sel of selectors) {
                 const img = document.querySelector(sel);
-                if (img?.src && img.naturalWidth > 50) return img.src;
+                if (img?.src && img.naturalWidth > 30) return img.src;
             }
-            // Last resort: first fimgs.net image (Fragrantica CDN)
-            const anyFimgs = document.querySelector('img[src*="fimgs.net"]');
-            return anyFimgs?.src || null;
+            return null;
         }).catch(() => null);
-
         return logoUrl;
-    } finally {
-        await page.close().catch(() => {});
-    }
+    } catch { return null; }
+    finally { await page.close().catch(() => {}); }
+}
+
+// Fragrantica — tries multiple slug patterns, most authoritative for fragrance brands
+async function tryLogoFromFragrantica(browser, brandName) {
+    const page = await browser.newPage();
+    try {
+        await addStealthScripts(page);
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+
+        for (const slug of brandSlugs(brandName)) {
+            try {
+                const url = `https://www.fragrantica.com/designers/${slug}.html`;
+                const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+                if (!resp || resp.status() === 404) continue;
+
+                await new Promise(r => setTimeout(r, 1200));
+
+                const logoUrl = await page.evaluate(() => {
+                    // Fragrantica stores brand images in /dizajneri/ path or fimgs CDN
+                    const selectors = [
+                        'img[src*="/dizajneri/"]',
+                        'img[src*="fimgs.net"][src*="brand"]',
+                        'img[src*="fimgs.net"][src*="mdimg"]',
+                        '.brand-header img',
+                        'header .cell img',
+                        'h1 + div img',
+                        '#main-content > div:first-child img',
+                    ];
+                    for (const sel of selectors) {
+                        const img = document.querySelector(sel);
+                        if (img?.src && img.naturalWidth > 40 && img.naturalHeight > 20) return img.src;
+                    }
+                    // Last resort: any fimgs.net image on the page
+                    const imgs = [...document.querySelectorAll('img[src*="fimgs.net"]')];
+                    const best = imgs.find(i => i.naturalWidth > 40 && !i.src.includes('/thumbs/'));
+                    return best?.src || null;
+                }).catch(() => null);
+
+                if (logoUrl) return logoUrl;
+            } catch { /* try next slug */ }
+        }
+        return null;
+    } finally { await page.close().catch(() => {}); }
 }
 
 // GET /api/scrape/brands/without-logos — list of brand names with no logo in DB
