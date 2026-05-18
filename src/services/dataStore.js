@@ -296,6 +296,15 @@ export const initDatabase = async () => {
       config JSONB DEFAULT '{}',
       updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
+
+    -- ===== PERFUMERS TABLE (verified perfumer data managed by admin) =====
+    CREATE TABLE IF NOT EXISTS perfumers (
+      name TEXT PRIMARY KEY,
+      image_url TEXT,
+      bio TEXT,
+      nationality TEXT,
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
   `;
 
     try {
@@ -806,6 +815,7 @@ export const dataStore = {
     },
 
     // Obtener todos los perfumistas únicos — divide nombres compuestos por coma
+    // Prioriza imagen verificada de la tabla perfumers sobre la scrapeada
     getPerfumers: async () => {
         if (!isDatabaseConnected) {
             const seen = new Map();
@@ -819,7 +829,6 @@ export const dataStore = {
             }
             return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
         }
-        // Expand comma-separated perfumers into individual rows, filter valid names, group
         const result = await pool.query(`
             WITH split AS (
                 SELECT
@@ -828,25 +837,69 @@ export const dataStore = {
                 FROM perfumes,
                 LATERAL unnest(string_to_array(perfumer, ',')) AS p_name
                 WHERE perfumer IS NOT NULL AND TRIM(perfumer) != ''
+            ),
+            grouped AS (
+                SELECT
+                    name,
+                    COUNT(*) AS count,
+                    MAX(perfumer_image_url) AS scraped_image
+                FROM split
+                WHERE
+                    TRIM(name) != ''
+                    AND length(name) >= 3
+                    AND name ~ '^[A-ZÁÉÍÓÚÀÈÌÒÙÄËÏÖÜÑÇ]'
+                    AND name !~ '[0-9]'
+                GROUP BY name
             )
             SELECT
-                name,
-                COUNT(*) AS count,
-                MAX(perfumer_image_url) AS image_url
-            FROM split
-            WHERE
-                TRIM(name) != ''
-                AND length(name) >= 3
-                AND name ~ '^[A-ZÁÉÍÓÚÀÈÌÒÙÄËÏÖÜÑÇ]'
-                AND name !~ '[0-9]'
-            GROUP BY name
-            ORDER BY name
+                g.name,
+                g.count,
+                COALESCE(pf.image_url, g.scraped_image) AS image_url,
+                pf.bio,
+                pf.nationality,
+                (pf.name IS NOT NULL) AS verified
+            FROM grouped g
+            LEFT JOIN perfumers pf ON LOWER(pf.name) = LOWER(g.name)
+            ORDER BY g.name
         `);
         return result.rows.map((row) => ({
             name: row.name,
             count: parseInt(row.count),
             imageUrl: row.image_url || null,
+            bio: row.bio || null,
+            nationality: row.nationality || null,
+            verified: row.verified || false,
         }));
+    },
+
+    // Obtener un perfumista por nombre (con datos verificados)
+    getPerfumerByName: async (name) => {
+        if (!isDatabaseConnected) return null;
+        const result = await pool.query(
+            'SELECT * FROM perfumers WHERE LOWER(name) = LOWER($1)',
+            [name]
+        );
+        return result.rows[0] || null;
+    },
+
+    // Guardar/actualizar datos verificados de un perfumista
+    upsertPerfumer: async ({ name, imageUrl, bio, nationality }) => {
+        if (!isDatabaseConnected) return;
+        await pool.query(`
+            INSERT INTO perfumers (name, image_url, bio, nationality, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (name) DO UPDATE SET
+                image_url = COALESCE($2, perfumers.image_url),
+                bio = COALESCE($3, perfumers.bio),
+                nationality = COALESCE($4, perfumers.nationality),
+                updated_at = NOW()
+        `, [name, imageUrl || null, bio || null, nationality || null]);
+    },
+
+    // Eliminar datos verificados de un perfumista (vuelve a usar scraped)
+    deletePerfumerData: async (name) => {
+        if (!isDatabaseConnected) return;
+        await pool.query('DELETE FROM perfumers WHERE LOWER(name) = LOWER($1)', [name]);
     },
 
     // Perfumes de un perfumista — busca su nombre en cualquier posición del campo

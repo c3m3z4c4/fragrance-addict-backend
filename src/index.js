@@ -17,6 +17,7 @@ import contentRoutes from './routes/content.js';
 import aiRoutes from './routes/ai.js';
 import activityRoutes from './routes/activity.js';
 import backupRoutes from './routes/backup.js';
+import perfumersRoutes from './routes/perfumers.js';
 import { initScheduler } from './services/backupScheduler.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { initDatabase, dataStore, getConnectionError } from './services/dataStore.js';
@@ -140,6 +141,7 @@ app.use('/api/content', contentRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/activity', activityRoutes);
 app.use('/api/backup', backupRoutes);
+app.use('/api/perfumers', perfumersRoutes);
 
 // Error handler
 app.use(errorHandler);
