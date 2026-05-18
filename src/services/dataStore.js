@@ -311,6 +311,20 @@ export const initDatabase = async () => {
         ALTER TABLE perfumers ADD COLUMN verified BOOLEAN DEFAULT FALSE;
       END IF;
     END $$;
+
+    -- ===== AI PROVIDERS TABLE =====
+    CREATE TABLE IF NOT EXISTS ai_providers (
+      provider VARCHAR(50) PRIMARY KEY,
+      api_key TEXT,
+      active_model VARCHAR(100),
+      is_active BOOLEAN DEFAULT FALSE,
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+    INSERT INTO ai_providers (provider, api_key, active_model, is_active) VALUES
+      ('google_gemini', NULL, 'gemini-2.5-flash', TRUE),
+      ('openai',        NULL, 'gpt-4o-mini',       FALSE),
+      ('anthropic',     NULL, 'claude-haiku-4-5-20251001', FALSE)
+    ON CONFLICT (provider) DO NOTHING;
   `;
 
     try {
@@ -1953,5 +1967,85 @@ export const dataStore = {
                 );
             }
         } catch {}
+    },
+
+    // ===== AI PROVIDERS METHODS =====
+
+    getAIProviders: async () => {
+        if (!isDatabaseConnected) return [];
+        try {
+            const result = await pool.query(
+                'SELECT provider, api_key, active_model, is_active, updated_at FROM ai_providers ORDER BY provider'
+            );
+            return result.rows.map(r => ({
+                provider: r.provider,
+                hasKey: !!r.api_key,
+                // Never return raw key — only masked version
+                apiKeyMasked: r.api_key ? r.api_key.slice(0, 6) + '…' + r.api_key.slice(-4) : null,
+                activeModel: r.active_model,
+                isActive: r.is_active,
+                updatedAt: r.updated_at,
+            }));
+        } catch (err) {
+            console.error('❌ getAIProviders:', err.message);
+            return [];
+        }
+    },
+
+    getActiveAIProvider: async () => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                'SELECT provider, api_key, active_model FROM ai_providers WHERE is_active = TRUE LIMIT 1'
+            );
+            if (!result.rows[0]) return null;
+            const r = result.rows[0];
+            return { provider: r.provider, apiKey: r.api_key, activeModel: r.active_model };
+        } catch (err) {
+            console.error('❌ getActiveAIProvider:', err.message);
+            return null;
+        }
+    },
+
+    getAIProviderKey: async (provider) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                'SELECT api_key, active_model FROM ai_providers WHERE provider = $1',
+                [provider]
+            );
+            return result.rows[0] || null;
+        } catch { return null; }
+    },
+
+    setAIProviderKey: async (provider, apiKey) => {
+        if (!isDatabaseConnected) return;
+        await pool.query(
+            `INSERT INTO ai_providers (provider, api_key, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (provider) DO UPDATE SET api_key = $2, updated_at = NOW()`,
+            [provider, apiKey || null]
+        );
+    },
+
+    setAIProviderModel: async (provider, model) => {
+        if (!isDatabaseConnected) return;
+        await pool.query(
+            `INSERT INTO ai_providers (provider, active_model, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (provider) DO UPDATE SET active_model = $2, updated_at = NOW()`,
+            [provider, model]
+        );
+    },
+
+    setActiveAIProvider: async (provider) => {
+        if (!isDatabaseConnected) return;
+        await pool.query('UPDATE ai_providers SET is_active = FALSE');
+        await pool.query(
+            `INSERT INTO ai_providers (provider, is_active, updated_at)
+             VALUES ($1, TRUE, NOW())
+             ON CONFLICT (provider) DO UPDATE SET is_active = TRUE, updated_at = NOW()`,
+            [provider]
+        );
     },
 };
