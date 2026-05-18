@@ -840,6 +840,57 @@ export const dataStore = {
         return result.rows.map(toCamelCase);
     },
 
+    // Marcas con las que ha trabajado un perfumista
+    getPerfumerBrands: async (name) => {
+        if (!isDatabaseConnected) {
+            const perfumes = memoryStore.filter(
+                (p) => p.perfumer?.toLowerCase() === name.toLowerCase()
+            );
+            const seen = new Map();
+            for (const p of perfumes) {
+                if (!p.brand) continue;
+                const key = p.brand.toLowerCase();
+                if (!seen.has(key)) seen.set(key, { name: p.brand, count: 0, imageUrl: p.imageUrl || null });
+                seen.get(key).count++;
+            }
+            return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+        }
+        const result = await pool.query(`
+            SELECT
+                brand AS name,
+                COUNT(*) AS count,
+                COALESCE(
+                    (SELECT b.logo_url FROM brands b WHERE LOWER(b.name) = LOWER(p2.brand) AND b.logo_url IS NOT NULL LIMIT 1),
+                    MAX(image_url)
+                ) AS image_url
+            FROM perfumes p2
+            WHERE LOWER(perfumer) = LOWER($1) AND brand IS NOT NULL
+            GROUP BY brand
+            ORDER BY brand
+        `, [name]);
+        return result.rows.map((row) => ({
+            name: row.name,
+            count: parseInt(row.count),
+            imageUrl: row.image_url || null,
+        }));
+    },
+
+    // Perfumes por perfumista y marca
+    getByPerfumerAndBrand: async (perfumer, brand) => {
+        if (!isDatabaseConnected) {
+            return memoryStore.filter(
+                (p) =>
+                    p.perfumer?.toLowerCase() === perfumer.toLowerCase() &&
+                    p.brand?.toLowerCase() === brand.toLowerCase()
+            );
+        }
+        const result = await pool.query(
+            'SELECT * FROM perfumes WHERE LOWER(perfumer) = LOWER($1) AND LOWER(brand) = LOWER($2) ORDER BY name',
+            [perfumer, brand]
+        );
+        return result.rows.map(toCamelCase);
+    },
+
     // Agregar perfume
     add: async (perfume) => {
         const id = perfume.id || uuidv4();

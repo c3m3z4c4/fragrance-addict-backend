@@ -95,6 +95,29 @@ router.get('/perfumers', async (req, res, next) => {
     }
 });
 
+// GET /api/perfumes/perfumer/:name/brands — brands a perfumer has worked with
+router.get('/perfumer/:name/brands', async (req, res, next) => {
+    try {
+        const brands = await dataStore.getPerfumerBrands(decodeURIComponent(req.params.name));
+        res.json({ success: true, data: brands });
+    } catch (error) {
+        next(error);
+    }
+});
+
+// GET /api/perfumes/perfumer/:name/brand/:brand — perfumes by perfumer + brand
+router.get('/perfumer/:name/brand/:brand', async (req, res, next) => {
+    try {
+        const perfumes = await dataStore.getByPerfumerAndBrand(
+            decodeURIComponent(req.params.name),
+            decodeURIComponent(req.params.brand)
+        );
+        res.json({ success: true, data: perfumes });
+    } catch (error) {
+        next(error);
+    }
+});
+
 // GET /api/perfumes/perfumer/:name — perfumes by a specific perfumer
 router.get('/perfumer/:name', async (req, res, next) => {
     try {
