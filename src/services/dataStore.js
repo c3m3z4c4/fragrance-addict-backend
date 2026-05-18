@@ -795,6 +795,51 @@ export const dataStore = {
         }));
     },
 
+    // Obtener todos los perfumistas únicos con conteo y imagen representativa
+    getPerfumers: async () => {
+        if (!isDatabaseConnected) {
+            const seen = new Map();
+            for (const p of memoryStore) {
+                if (!p.perfumer) continue;
+                const key = p.perfumer.toLowerCase();
+                if (!seen.has(key)) {
+                    seen.set(key, { name: p.perfumer, count: 0, imageUrl: p.perfumerImageUrl || null });
+                }
+                seen.get(key).count++;
+            }
+            return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+        }
+        const result = await pool.query(`
+            SELECT
+                perfumer AS name,
+                COUNT(*) AS count,
+                MAX(perfumer_image_url) AS image_url
+            FROM perfumes
+            WHERE perfumer IS NOT NULL AND TRIM(perfumer) != ''
+            GROUP BY perfumer
+            ORDER BY perfumer
+        `);
+        return result.rows.map((row) => ({
+            name: row.name,
+            count: parseInt(row.count),
+            imageUrl: row.image_url || null,
+        }));
+    },
+
+    // Perfumes de un perfumista específico
+    getByPerfumer: async (name) => {
+        if (!isDatabaseConnected) {
+            return memoryStore.filter(
+                (p) => p.perfumer?.toLowerCase() === name.toLowerCase()
+            );
+        }
+        const result = await pool.query(
+            'SELECT * FROM perfumes WHERE LOWER(perfumer) = LOWER($1) ORDER BY name',
+            [name]
+        );
+        return result.rows.map(toCamelCase);
+    },
+
     // Agregar perfume
     add: async (perfume) => {
         const id = perfume.id || uuidv4();
