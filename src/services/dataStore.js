@@ -303,8 +303,14 @@ export const initDatabase = async () => {
       image_url TEXT,
       bio TEXT,
       nationality TEXT,
+      verified BOOLEAN DEFAULT FALSE,
       updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='perfumers' AND column_name='verified') THEN
+        ALTER TABLE perfumers ADD COLUMN verified BOOLEAN DEFAULT FALSE;
+      END IF;
+    END $$;
   `;
 
     try {
@@ -857,7 +863,7 @@ export const dataStore = {
                 COALESCE(pf.image_url, g.scraped_image) AS image_url,
                 pf.bio,
                 pf.nationality,
-                (pf.name IS NOT NULL) AS verified
+                COALESCE(pf.verified, FALSE) AS verified
             FROM grouped g
             LEFT JOIN perfumers pf ON LOWER(pf.name) = LOWER(g.name)
             ORDER BY g.name
@@ -883,17 +889,28 @@ export const dataStore = {
     },
 
     // Guardar/actualizar datos verificados de un perfumista
-    upsertPerfumer: async ({ name, imageUrl, bio, nationality }) => {
+    upsertPerfumer: async ({ name, imageUrl, bio, nationality, verified }) => {
         if (!isDatabaseConnected) return;
         await pool.query(`
-            INSERT INTO perfumers (name, image_url, bio, nationality, updated_at)
-            VALUES ($1, $2, $3, $4, NOW())
+            INSERT INTO perfumers (name, image_url, bio, nationality, verified, updated_at)
+            VALUES ($1, $2, $3, $4, $5, NOW())
             ON CONFLICT (name) DO UPDATE SET
                 image_url = COALESCE($2, perfumers.image_url),
                 bio = COALESCE($3, perfumers.bio),
                 nationality = COALESCE($4, perfumers.nationality),
+                verified = COALESCE($5, perfumers.verified),
                 updated_at = NOW()
-        `, [name, imageUrl || null, bio || null, nationality || null]);
+        `, [name, imageUrl ?? null, bio ?? null, nationality ?? null, verified ?? null]);
+    },
+
+    // Toggle verificado sin tocar el resto de datos
+    setPerfumerVerified: async (name, verified) => {
+        if (!isDatabaseConnected) return;
+        await pool.query(`
+            INSERT INTO perfumers (name, verified, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (name) DO UPDATE SET verified = $2, updated_at = NOW()
+        `, [name, verified]);
     },
 
     // Eliminar datos verificados de un perfumista (vuelve a usar scraped)
