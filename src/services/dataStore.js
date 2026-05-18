@@ -795,29 +795,52 @@ export const dataStore = {
         }));
     },
 
-    // Obtener todos los perfumistas únicos con conteo y imagen representativa
+    // Helper: split perfumer field by comma, trim, filter valid person names
+    // A valid name: starts with uppercase letter, >= 3 chars, no digits
+    _splitPerfumers: (raw) => {
+        if (!raw) return [];
+        return raw
+            .split(',')
+            .map(s => s.trim())
+            .filter(s => s.length >= 3 && /^[A-ZÁÉÍÓÚÀÈÌÒÙÄËÏÖÜÑÇ]/.test(s) && !/\d/.test(s));
+    },
+
+    // Obtener todos los perfumistas únicos — divide nombres compuestos por coma
     getPerfumers: async () => {
         if (!isDatabaseConnected) {
             const seen = new Map();
             for (const p of memoryStore) {
-                if (!p.perfumer) continue;
-                const key = p.perfumer.toLowerCase();
-                if (!seen.has(key)) {
-                    seen.set(key, { name: p.perfumer, count: 0, imageUrl: p.perfumerImageUrl || null });
+                const names = dataStore._splitPerfumers(p.perfumer);
+                for (const name of names) {
+                    const key = name.toLowerCase();
+                    if (!seen.has(key)) seen.set(key, { name, count: 0, imageUrl: p.perfumerImageUrl || null });
+                    seen.get(key).count++;
                 }
-                seen.get(key).count++;
             }
             return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
         }
+        // Expand comma-separated perfumers into individual rows, filter valid names, group
         const result = await pool.query(`
+            WITH split AS (
+                SELECT
+                    TRIM(p_name) AS name,
+                    perfumer_image_url
+                FROM perfumes,
+                LATERAL unnest(string_to_array(perfumer, ',')) AS p_name
+                WHERE perfumer IS NOT NULL AND TRIM(perfumer) != ''
+            )
             SELECT
-                perfumer AS name,
+                name,
                 COUNT(*) AS count,
                 MAX(perfumer_image_url) AS image_url
-            FROM perfumes
-            WHERE perfumer IS NOT NULL AND TRIM(perfumer) != ''
-            GROUP BY perfumer
-            ORDER BY perfumer
+            FROM split
+            WHERE
+                TRIM(name) != ''
+                AND length(name) >= 3
+                AND name ~ '^[A-ZÁÉÍÓÚÀÈÌÒÙÄËÏÖÜÑÇ]'
+                AND name !~ '[0-9]'
+            GROUP BY name
+            ORDER BY name
         `);
         return result.rows.map((row) => ({
             name: row.name,
@@ -826,25 +849,32 @@ export const dataStore = {
         }));
     },
 
-    // Perfumes de un perfumista específico
+    // Perfumes de un perfumista — busca su nombre en cualquier posición del campo
     getByPerfumer: async (name) => {
         if (!isDatabaseConnected) {
-            return memoryStore.filter(
-                (p) => p.perfumer?.toLowerCase() === name.toLowerCase()
+            return memoryStore.filter((p) =>
+                dataStore._splitPerfumers(p.perfumer)
+                    .some(n => n.toLowerCase() === name.toLowerCase())
             );
         }
-        const result = await pool.query(
-            'SELECT * FROM perfumes WHERE LOWER(perfumer) = LOWER($1) ORDER BY name',
-            [name]
-        );
+        const result = await pool.query(`
+            SELECT * FROM perfumes
+            WHERE EXISTS (
+                SELECT 1
+                FROM unnest(string_to_array(LOWER(perfumer), ',')) AS p_name
+                WHERE TRIM(p_name) = LOWER($1)
+            )
+            ORDER BY name
+        `, [name]);
         return result.rows.map(toCamelCase);
     },
 
-    // Marcas con las que ha trabajado un perfumista
+    // Marcas con las que ha trabajado un perfumista (busca en campo compuesto)
     getPerfumerBrands: async (name) => {
         if (!isDatabaseConnected) {
-            const perfumes = memoryStore.filter(
-                (p) => p.perfumer?.toLowerCase() === name.toLowerCase()
+            const perfumes = memoryStore.filter((p) =>
+                dataStore._splitPerfumers(p.perfumer)
+                    .some(n => n.toLowerCase() === name.toLowerCase())
             );
             const seen = new Map();
             for (const p of perfumes) {
@@ -857,16 +887,21 @@ export const dataStore = {
         }
         const result = await pool.query(`
             SELECT
-                brand AS name,
+                p2.brand AS name,
                 COUNT(*) AS count,
                 COALESCE(
                     (SELECT b.logo_url FROM brands b WHERE LOWER(b.name) = LOWER(p2.brand) AND b.logo_url IS NOT NULL LIMIT 1),
-                    MAX(image_url)
+                    MAX(p2.image_url)
                 ) AS image_url
             FROM perfumes p2
-            WHERE LOWER(perfumer) = LOWER($1) AND brand IS NOT NULL
-            GROUP BY brand
-            ORDER BY brand
+            WHERE EXISTS (
+                SELECT 1
+                FROM unnest(string_to_array(LOWER(p2.perfumer), ',')) AS p_name
+                WHERE TRIM(p_name) = LOWER($1)
+            )
+            AND p2.brand IS NOT NULL
+            GROUP BY p2.brand
+            ORDER BY p2.brand
         `, [name]);
         return result.rows.map((row) => ({
             name: row.name,
@@ -878,16 +913,22 @@ export const dataStore = {
     // Perfumes por perfumista y marca
     getByPerfumerAndBrand: async (perfumer, brand) => {
         if (!isDatabaseConnected) {
-            return memoryStore.filter(
-                (p) =>
-                    p.perfumer?.toLowerCase() === perfumer.toLowerCase() &&
-                    p.brand?.toLowerCase() === brand.toLowerCase()
+            return memoryStore.filter((p) =>
+                dataStore._splitPerfumers(p.perfumer)
+                    .some(n => n.toLowerCase() === perfumer.toLowerCase()) &&
+                p.brand?.toLowerCase() === brand.toLowerCase()
             );
         }
-        const result = await pool.query(
-            'SELECT * FROM perfumes WHERE LOWER(perfumer) = LOWER($1) AND LOWER(brand) = LOWER($2) ORDER BY name',
-            [perfumer, brand]
-        );
+        const result = await pool.query(`
+            SELECT * FROM perfumes
+            WHERE EXISTS (
+                SELECT 1
+                FROM unnest(string_to_array(LOWER(perfumer), ',')) AS p_name
+                WHERE TRIM(p_name) = LOWER($1)
+            )
+            AND LOWER(brand) = LOWER($2)
+            ORDER BY name
+        `, [perfumer, brand]);
         return result.rows.map(toCamelCase);
     },
 
