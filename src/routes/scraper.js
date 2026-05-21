@@ -1075,7 +1075,7 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
 
     // Run discovery asynchronously after the response is sent
     setImmediate(async () => {
-        console.log('🌍 [bg] Full catalog import: reading Fragrantica sitemaps via Puppeteer...');
+        console.log('🌍 [bg] Full catalog import: reading Fragrantica sitemaps...');
 
         // Reset and start discovery tracking
         catalogDiscovery = {
@@ -1091,25 +1091,51 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
             error: null,
         };
 
-        let browser = null;
-        try {
-            const puppeteer = (await import('puppeteer')).default;
-            browser = await puppeteer.launch(BROWSER_CONFIG);
+        // User-agent rotation — try search-engine crawlers first (usually whitelisted by WAFs)
+        const USER_AGENTS = [
+            'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+            'Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+        ];
 
-            const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-
-            const fetchXml = async (url) => {
-                const page = await browser.newPage();
+        // Fetch XML via plain HTTP — no headless browser needed for static XML files
+        const fetchXml = async (url) => {
+            let lastErr;
+            for (const ua of USER_AGENTS) {
                 try {
-                    await page.setUserAgent(BROWSER_UA);
-                    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-                    await page.goto(url, { waitUntil: 'load', timeout: 60000 });
-                    return await page.content();
-                } finally {
-                    await page.close();
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), 30000);
+                    const res = await fetch(url, {
+                        signal: controller.signal,
+                        headers: {
+                            'User-Agent': ua,
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Accept-Encoding': 'gzip, deflate, br',
+                            'Cache-Control': 'no-cache',
+                        },
+                    });
+                    clearTimeout(timer);
+                    if (!res.ok) {
+                        lastErr = new Error(`HTTP ${res.status}`);
+                        console.warn(`  [bg] ${url} → ${res.status} with UA: ${ua.slice(0, 40)}…`);
+                        continue;
+                    }
+                    const text = await res.text();
+                    console.log(`  [bg] ✓ Fetched ${url} (${text.length} chars) with UA: ${ua.slice(0, 40)}…`);
+                    return text;
+                } catch (err) {
+                    lastErr = err;
+                    console.warn(`  [bg] fetch error for ${url}: ${err.message}`);
                 }
-            };
+                // Brief pause before trying next UA
+                await new Promise(r => setTimeout(r, 1000));
+            }
+            throw lastErr || new Error(`All user-agents failed for ${url}`);
+        };
 
+        try {
             // ── 1. Discover sub-sitemap files from the index ──
             let sitemapUrls = [];
             try {
@@ -1118,12 +1144,12 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
                 sitemapUrls = [...new Set(matches)];
                 console.log(`  [bg] Sitemap index: found ${sitemapUrls.length} perfume sub-sitemaps`);
             } catch (err) {
-                console.warn(`  [bg] ⚠️ Could not fetch sitemap.xml: ${err.message}`);
+                console.warn(`  [bg] ⚠️ Could not fetch sitemap index: ${err.message}`);
             }
 
-            // Fallback: probe known numbered paths (Fragrantica uses sitemap_perfumes_1.xml … N.xml)
+            // Fallback: probe known numbered paths (Fragrantica typically uses up to ~13 files)
             if (sitemapUrls.length === 0) {
-                for (let i = 1; i <= 6; i++) {
+                for (let i = 1; i <= 13; i++) {
                     sitemapUrls.push(`https://www.fragrantica.com/sitemap_perfumes_${i}.xml`);
                 }
                 console.log(`  [bg] Fallback: probing ${sitemapUrls.length} candidate sub-sitemap URLs`);
@@ -1145,21 +1171,23 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
                     if (urls.length > 0) {
                         allFound.push(...urls);
                         catalogDiscovery.urlsFound = allFound.length;
-                        console.log(`  [bg] ${sitemapUrl}: ${urls.length} URLs`);
+                        console.log(`  [bg] ${sitemapUrl}: ${urls.length} URLs (total so far: ${allFound.length})`);
                     } else {
-                        console.log(`  [bg] ${sitemapUrl}: 0 URLs (empty or blocked)`);
+                        console.log(`  [bg] ${sitemapUrl}: 0 URLs (empty or end of list)`);
                     }
                 } catch (err) {
                     console.warn(`  [bg] ⚠️ Skipping ${sitemapUrl}: ${err.message}`);
                 }
                 catalogDiscovery.sitemapsProcessed++;
+                // Small delay between sitemap files to be polite
+                await new Promise(r => setTimeout(r, 2000));
             }
 
             if (allFound.length === 0) {
-                console.error('[bg] ❌ Full catalog: no URLs found from any sitemap. Fragrantica may be blocking access.');
+                console.error('[bg] ❌ Full catalog: no URLs found from any sitemap.');
                 catalogDiscovery.active = false;
                 catalogDiscovery.phase = 'error';
-                catalogDiscovery.error = 'No URLs found — Fragrantica may be blocking sitemap access.';
+                catalogDiscovery.error = 'No se encontraron URLs. Fragrantica puede estar bloqueando el acceso — intenta de nuevo en unos minutos.';
                 catalogDiscovery.finishedAt = new Date().toISOString();
                 return;
             }
@@ -1184,8 +1212,6 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
             catalogDiscovery.phase = 'error';
             catalogDiscovery.error = err.message;
             catalogDiscovery.finishedAt = new Date().toISOString();
-        } finally {
-            if (browser) await browser.close().catch(() => {});
         }
     });
 });
