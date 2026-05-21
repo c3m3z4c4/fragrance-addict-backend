@@ -53,6 +53,21 @@ let scrapingQueue = {
     failed: 0,
 };
 
+// Bulk brand import job state
+let brandImportJob = {
+    active: false,
+    paused: false,
+    brandsTotal: 0,
+    brandsProcessed: 0,
+    brandsSucceeded: 0,
+    brandsFailed: 0,
+    urlsQueued: 0,
+    currentBrand: null,
+    results: [],      // [{ brand, queued, skipped, total, error }]
+    startedAt: null,
+    finishedAt: null,
+};
+
 // Discovery phase state — tracks background sitemap reading progress
 let catalogDiscovery = {
     active: false,
@@ -345,6 +360,92 @@ router.post('/brands', requireSuperAdmin, async (req, res, next) => {
     } catch (error) {
         next(new ApiError(error.message, 500));
     }
+});
+
+// POST /api/scrape/brands/bulk - Start background bulk brand import job
+router.post('/brands/bulk', requireSuperAdmin, async (req, res) => {
+    const { brands, limitPerBrand = 500 } = req.body;
+
+    if (!Array.isArray(brands) || brands.length === 0) {
+        return res.json({ success: false, error: 'brands array is required' });
+    }
+    if (brandImportJob.active) {
+        return res.json({ success: false, error: 'A bulk brand import is already running' });
+    }
+
+    const cleanBrands = [...new Set(brands.map(b => String(b).trim()).filter(Boolean))];
+
+    brandImportJob = {
+        active: true,
+        paused: false,
+        brandsTotal: cleanBrands.length,
+        brandsProcessed: 0,
+        brandsSucceeded: 0,
+        brandsFailed: 0,
+        urlsQueued: 0,
+        currentBrand: null,
+        results: [],
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+    };
+
+    res.json({ success: true, total: cleanBrands.length, message: 'Bulk brand import started in background' });
+
+    // Run in background
+    setImmediate(async () => {
+        const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
+        const limit = parseInt(limitPerBrand) || 500;
+
+        for (const brand of cleanBrands) {
+            // Respect pause
+            while (brandImportJob.paused && brandImportJob.active) {
+                await new Promise(r => setTimeout(r, 1000));
+            }
+            if (!brandImportJob.active) break;
+
+            brandImportJob.currentBrand = brand;
+            try {
+                const { urls, brandUrl, logoUrl } = await fetchBrandUrls(brand, limit);
+                await dataStore.upsertBrand(brand, logoUrl, brandUrl).catch(() => {});
+
+                const newUrls = urls.filter(u => !existingUrls.has(u));
+                const added = await enqueueUrls(newUrls, false);
+                newUrls.forEach(u => existingUrls.add(u));
+
+                brandImportJob.urlsQueued += added;
+                brandImportJob.brandsSucceeded++;
+                brandImportJob.results.push({ brand, total: urls.length, queued: added, skipped: urls.length - added, logoUrl: !!logoUrl });
+            } catch (err) {
+                brandImportJob.brandsFailed++;
+                brandImportJob.results.push({ brand, total: 0, queued: 0, skipped: 0, error: err.message });
+            }
+            brandImportJob.brandsProcessed++;
+        }
+
+        brandImportJob.active = false;
+        brandImportJob.currentBrand = null;
+        brandImportJob.finishedAt = new Date().toISOString();
+    });
+});
+
+// POST /api/scrape/brands/bulk/pause - Pause/resume bulk brand import
+router.post('/brands/bulk/pause', requireSuperAdmin, (req, res) => {
+    if (!brandImportJob.active) return res.json({ success: false, error: 'No active bulk import' });
+    brandImportJob.paused = !brandImportJob.paused;
+    res.json({ success: true, paused: brandImportJob.paused });
+});
+
+// POST /api/scrape/brands/bulk/stop - Stop bulk brand import
+router.post('/brands/bulk/stop', requireSuperAdmin, (req, res) => {
+    brandImportJob.active = false;
+    brandImportJob.paused = false;
+    brandImportJob.finishedAt = new Date().toISOString();
+    res.json({ success: true });
+});
+
+// GET /api/scrape/brands/bulk/status - Get bulk brand import status
+router.get('/brands/bulk/status', requireSuperAdmin, (req, res) => {
+    res.json({ success: true, job: { ...brandImportJob } });
 });
 
 // POST /api/scrape/sitemap - Obtener URLs del sitemap de Fragrantica
@@ -680,6 +781,8 @@ router.get('/queue/status', requireSuperAdmin, async (req, res) => {
         etaMs,
         // Discovery phase state
         catalogDiscovery: { ...catalogDiscovery },
+        // Bulk brand import job
+        brandImportJob: { ...brandImportJob, results: brandImportJob.results.slice(-50) },
     });
 });
 
