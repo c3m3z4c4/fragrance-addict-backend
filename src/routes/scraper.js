@@ -53,6 +53,20 @@ let scrapingQueue = {
     failed: 0,
 };
 
+// Discovery phase state — tracks background sitemap reading progress
+let catalogDiscovery = {
+    active: false,
+    phase: null,        // 'reading_index' | 'reading_sitemaps' | 'enqueueing' | 'done' | 'error'
+    currentSitemap: null,
+    sitemapsTotal: 0,
+    sitemapsProcessed: 0,
+    urlsFound: 0,
+    urlsQueued: 0,
+    startedAt: null,
+    finishedAt: null,
+    error: null,
+};
+
 /** Enqueue URLs into DB and optionally start processing. Returns count added.
  *  force=true: re-scrape mode — bypasses existsBySourceUrl check, resets done/failed entries. */
 async function enqueueUrls(urls, autoStart = false, force = false) {
@@ -633,6 +647,20 @@ router.post('/queue/stop', requireSuperAdmin, async (req, res) => {
 // GET /api/scrape/queue/status - Queue status (DB counts + in-memory session info)
 router.get('/queue/status', requireSuperAdmin, async (req, res) => {
     const stats = await dataStore.queueStats().catch(() => ({ pending: 0, processing: 0, done: 0, failed: 0, total: 0 }));
+
+    // Compute processing rate and ETA from session data
+    let processingRatePerHour = null;
+    let etaMs = null;
+    if (scrapingQueue.processing && scrapingQueue.startedAt && scrapingQueue.processedThisSession > 0) {
+        const elapsedMs = Date.now() - new Date(scrapingQueue.startedAt).getTime();
+        const elapsedHours = elapsedMs / (1000 * 60 * 60);
+        processingRatePerHour = Math.round(scrapingQueue.processedThisSession / elapsedHours);
+        const remaining = (stats.pending || 0) + (stats.processing || 0);
+        if (processingRatePerHour > 0) {
+            etaMs = Math.round((remaining / processingRatePerHour) * 60 * 60 * 1000);
+        }
+    }
+
     res.json({
         success: true,
         processing: scrapingQueue.processing,
@@ -647,6 +675,11 @@ router.get('/queue/status', requireSuperAdmin, async (req, res) => {
         failedThisSession: scrapingQueue.failedThisSession,
         startedAt: scrapingQueue.startedAt,
         errors: scrapingQueue.errors.slice(-10),
+        // Performance metrics
+        processingRatePerHour,
+        etaMs,
+        // Discovery phase state
+        catalogDiscovery: { ...catalogDiscovery },
     });
 });
 
@@ -1043,6 +1076,21 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
     // Run discovery asynchronously after the response is sent
     setImmediate(async () => {
         console.log('🌍 [bg] Full catalog import: reading Fragrantica sitemaps via Puppeteer...');
+
+        // Reset and start discovery tracking
+        catalogDiscovery = {
+            active: true,
+            phase: 'reading_index',
+            currentSitemap: 'sitemap.xml',
+            sitemapsTotal: 0,
+            sitemapsProcessed: 0,
+            urlsFound: 0,
+            urlsQueued: 0,
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+            error: null,
+        };
+
         let browser = null;
         try {
             const puppeteer = (await import('puppeteer')).default;
@@ -1081,17 +1129,22 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
                 console.log(`  [bg] Fallback: probing ${sitemapUrls.length} candidate sub-sitemap URLs`);
             }
 
+            catalogDiscovery.sitemapsTotal = sitemapUrls.length;
+            catalogDiscovery.phase = 'reading_sitemaps';
+
             // ── 2. Extract perfume URLs from each sub-sitemap ──
             const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
             const allFound = [];
 
             for (const sitemapUrl of sitemapUrls) {
+                catalogDiscovery.currentSitemap = sitemapUrl.split('/').pop();
                 try {
                     const xml = await fetchXml(sitemapUrl);
                     const urls = (xml.match(/https?:\/\/[^\s<>"]*\/perfume\/[^<\s"]+\.html/g) || [])
                         .filter(u => /\/perfume\/[^/]+\/[^/]+\.html$/.test(u));
                     if (urls.length > 0) {
                         allFound.push(...urls);
+                        catalogDiscovery.urlsFound = allFound.length;
                         console.log(`  [bg] ${sitemapUrl}: ${urls.length} URLs`);
                     } else {
                         console.log(`  [bg] ${sitemapUrl}: 0 URLs (empty or blocked)`);
@@ -1099,10 +1152,15 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
                 } catch (err) {
                     console.warn(`  [bg] ⚠️ Skipping ${sitemapUrl}: ${err.message}`);
                 }
+                catalogDiscovery.sitemapsProcessed++;
             }
 
             if (allFound.length === 0) {
                 console.error('[bg] ❌ Full catalog: no URLs found from any sitemap. Fragrantica may be blocking access.');
+                catalogDiscovery.active = false;
+                catalogDiscovery.phase = 'error';
+                catalogDiscovery.error = 'No URLs found — Fragrantica may be blocking sitemap access.';
+                catalogDiscovery.finishedAt = new Date().toISOString();
                 return;
             }
 
@@ -1110,11 +1168,22 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
             const newUrls = uniqueUrls.filter(u => !existingUrls.has(u));
 
             // ── 3. Add new URLs to persistent DB queue ──
+            catalogDiscovery.phase = 'enqueueing';
+            catalogDiscovery.currentSitemap = null;
             const added = await enqueueUrls(newUrls, autoStart);
+            catalogDiscovery.urlsQueued = added;
 
             console.log(`✅ [bg] Full catalog done: ${uniqueUrls.length} unique found, ${added} new queued, ${uniqueUrls.length - added} already existed`);
+
+            catalogDiscovery.active = false;
+            catalogDiscovery.phase = 'done';
+            catalogDiscovery.finishedAt = new Date().toISOString();
         } catch (err) {
             console.error('[bg] ❌ Full catalog discovery error:', err.message);
+            catalogDiscovery.active = false;
+            catalogDiscovery.phase = 'error';
+            catalogDiscovery.error = err.message;
+            catalogDiscovery.finishedAt = new Date().toISOString();
         } finally {
             if (browser) await browser.close().catch(() => {});
         }
