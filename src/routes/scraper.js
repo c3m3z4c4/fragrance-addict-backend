@@ -6,6 +6,7 @@ import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
+import { getAlgoliaJobState } from './algolia.js';
 
 // Memory storage — logos stored as base64 data URLs in the DB, no disk dependency
 const logoUpload = multer({
@@ -783,6 +784,8 @@ router.get('/queue/status', requireSuperAdmin, async (req, res) => {
         catalogDiscovery: { ...catalogDiscovery },
         // Bulk brand import job
         brandImportJob: { ...brandImportJob, results: brandImportJob.results.slice(-50) },
+        // Algolia import job
+        algoliaJob: getAlgoliaJobState(),
     });
 });
 
