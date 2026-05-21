@@ -1091,48 +1091,72 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
             error: null,
         };
 
-        // User-agent rotation — try search-engine crawlers first (usually whitelisted by WAFs)
-        const USER_AGENTS = [
-            'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-            'Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
-        ];
+        // Detect Cloudflare / bot-challenge HTML responses (status 200 but not real XML)
+        const isBlockedResponse = (text) =>
+            text.includes('cf-browser-verification') ||
+            text.includes('cf_clearance') ||
+            text.includes('Just a moment') ||
+            text.includes('Enable JavaScript') ||
+            (text.trim().startsWith('<html') && !text.includes('<urlset') && !text.includes('<sitemapindex'));
 
-        // Fetch XML via plain HTTP — no headless browser needed for static XML files
-        const fetchXml = async (url) => {
-            let lastErr;
-            for (const ua of USER_AGENTS) {
-                try {
-                    const controller = new AbortController();
-                    const timer = setTimeout(() => controller.abort(), 30000);
-                    const res = await fetch(url, {
-                        signal: controller.signal,
-                        headers: {
-                            'User-Agent': ua,
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                            'Accept-Language': 'en-US,en;q=0.9',
-                            'Accept-Encoding': 'gzip, deflate, br',
-                            'Cache-Control': 'no-cache',
-                        },
-                    });
-                    clearTimeout(timer);
-                    if (!res.ok) {
-                        lastErr = new Error(`HTTP ${res.status}`);
-                        console.warn(`  [bg] ${url} → ${res.status} with UA: ${ua.slice(0, 40)}…`);
-                        continue;
-                    }
-                    const text = await res.text();
-                    console.log(`  [bg] ✓ Fetched ${url} (${text.length} chars) with UA: ${ua.slice(0, 40)}…`);
-                    return text;
-                } catch (err) {
-                    lastErr = err;
-                    console.warn(`  [bg] fetch error for ${url}: ${err.message}`);
-                }
-                // Brief pause before trying next UA
-                await new Promise(r => setTimeout(r, 1000));
+        // Simple HTTP fetch with timeout
+        const httpGet = async (url, ua) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 30000);
+            try {
+                const res = await fetch(url, {
+                    signal: controller.signal,
+                    headers: {
+                        'User-Agent': ua,
+                        'Accept': 'application/xml,text/xml,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Cache-Control': 'no-cache',
+                    },
+                });
+                clearTimeout(timer);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return await res.text();
+            } finally {
+                clearTimeout(timer);
             }
-            throw lastErr || new Error(`All user-agents failed for ${url}`);
+        };
+
+        // Fetch via Wayback Machine — archive.org has no Cloudflare bot protection
+        // and indexes Fragrantica sitemaps regularly.
+        const fetchViaWayback = async (originalUrl) => {
+            // Ask Wayback for the most recent snapshot
+            const apiUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(originalUrl)}`;
+            const meta = await httpGet(apiUrl, 'Mozilla/5.0 (compatible; FragranceAddict/1.0)');
+            const { archived_snapshots } = JSON.parse(meta);
+            const snapshot = archived_snapshots?.closest;
+            if (!snapshot?.available || !snapshot.url) throw new Error('No Wayback snapshot available');
+            console.log(`  [bg] Wayback snapshot: ${snapshot.url} (${snapshot.timestamp})`);
+            return httpGet(snapshot.url, 'Mozilla/5.0 (compatible; FragranceAddict/1.0)');
+        };
+
+        // Try direct fetch first, fall back to Wayback Machine on block/failure
+        const fetchXml = async (url) => {
+            // 1. Direct fetch with Googlebot UA (most likely whitelisted)
+            for (const ua of [
+                'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+                'Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)',
+            ]) {
+                try {
+                    const text = await httpGet(url, ua);
+                    if (!isBlockedResponse(text)) {
+                        console.log(`  [bg] ✓ Direct fetch OK: ${url}`);
+                        return text;
+                    }
+                    console.warn(`  [bg] Cloudflare challenge detected for ${url} (UA: ${ua.slice(0, 30)})`);
+                } catch (err) {
+                    console.warn(`  [bg] Direct fetch failed: ${err.message}`);
+                }
+            }
+            // 2. Fallback: Wayback Machine
+            console.log(`  [bg] Trying Wayback Machine for ${url}…`);
+            const text = await fetchViaWayback(url);
+            if (isBlockedResponse(text)) throw new Error('Wayback snapshot also returned a non-XML response');
+            return text;
         };
 
         try {
@@ -1179,15 +1203,13 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
                     console.warn(`  [bg] ⚠️ Skipping ${sitemapUrl}: ${err.message}`);
                 }
                 catalogDiscovery.sitemapsProcessed++;
-                // Small delay between sitemap files to be polite
-                await new Promise(r => setTimeout(r, 2000));
             }
 
             if (allFound.length === 0) {
-                console.error('[bg] ❌ Full catalog: no URLs found from any sitemap.');
+                console.error('[bg] ❌ Full catalog: no URLs found from any source.');
                 catalogDiscovery.active = false;
                 catalogDiscovery.phase = 'error';
-                catalogDiscovery.error = 'No se encontraron URLs. Fragrantica puede estar bloqueando el acceso — intenta de nuevo en unos minutos.';
+                catalogDiscovery.error = 'No se encontraron URLs. Fragrantica y Wayback Machine no devolvieron resultados — intenta de nuevo en unos minutos.';
                 catalogDiscovery.finishedAt = new Date().toISOString();
                 return;
             }
