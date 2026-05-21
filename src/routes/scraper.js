@@ -1054,6 +1054,41 @@ router.post('/reset', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
+// POST /api/scrape/catalog/upload - Parse uploaded sitemap XML files and queue URLs
+const xmlUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 20 } });
+router.post('/catalog/upload', requireSuperAdmin, xmlUpload.array('sitemaps'), async (req, res, next) => {
+    try {
+        const files = req.files || [];
+        if (files.length === 0) return res.json({ success: false, error: 'No files uploaded' });
+
+        const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
+        const allFound = [];
+
+        for (const file of files) {
+            const xml = file.buffer.toString('utf-8');
+            const urls = (xml.match(/https?:\/\/[^\s<>"]*\/perfume\/[^<\s"]+\.html/g) || [])
+                .filter(u => /\/perfume\/[^/]+\/[^/]+\.html$/.test(u));
+            allFound.push(...urls);
+            console.log(`📂 Sitemap upload "${file.originalname}": ${urls.length} URLs`);
+        }
+
+        const uniqueUrls = [...new Set(allFound)];
+        const newUrls = uniqueUrls.filter(u => !existingUrls.has(u));
+        const added = await enqueueUrls(newUrls, false);
+
+        console.log(`✅ Sitemap upload done: ${uniqueUrls.length} found, ${added} new queued`);
+        res.json({
+            success: true,
+            filesProcessed: files.length,
+            totalFound: uniqueUrls.length,
+            newQueued: added,
+            alreadyExist: uniqueUrls.length - added,
+        });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
+    }
+});
+
 // POST /api/scrape/catalog/full - Discover & queue ALL perfumes from Fragrantica sitemaps
 // Responds immediately (202) to avoid Traefik timeout; discovery runs in background.
 router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
