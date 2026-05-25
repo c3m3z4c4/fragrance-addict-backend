@@ -131,25 +131,22 @@ async function fetchAllFacetValues(field) {
     return results;
 }
 
-// Browse ALL records in the index using cursor-based pagination (no depth limit)
-async function browseAllPerfumes() {
+// Fetch ALL perfumes for a brand using facetFilters (correct syntax for string facets)
+async function fetchPerfumesForBrand(brand, maxPages = 200) {
     const urls = [];
-    let cursor = null;
-    let batches = 0;
-    do {
-        const body = cursor
-            ? { cursor }
-            : { query: '', hitsPerPage: 1000, attributesToRetrieve: ['naslov', 'dizajner', 'objectID'] };
-        const data = await algoliaPost(`/1/indexes/${INDEX}/browse`, body);
+    for (let page = 0; page < maxPages; page++) {
+        const data = await algoliaPost(`/1/indexes/${INDEX}/query`, {
+            query: '',
+            facetFilters: [`dizajner:${brand}`],
+            hitsPerPage: 1000,
+            page,
+            attributesToRetrieve: ['naslov', 'dizajner', 'objectID'],
+        });
         const hits = data.hits || [];
         hits.forEach(h => urls.push(buildPerfumeUrl(h)));
-        cursor = data.cursor || null;
-        batches++;
-        if (batches % 20 === 0) {
-            console.log(`[algolia] Browse: ${urls.length} perfumes so far (batch ${batches})…`);
-        }
-        if (cursor) await new Promise(r => setTimeout(r, 100));
-    } while (cursor);
+        if (data.page >= (data.nbPages || 1) - 1) break;
+        await new Promise(r => setTimeout(r, 150));
+    }
     return urls;
 }
 
@@ -220,7 +217,7 @@ router.post('/import/catalog', requireSuperAdmin, async (req, res) => {
     }
 
     algoliaImportJob = {
-        active: true, phase: 'browsing', brandsDiscovered: 0,
+        active: true, phase: 'brands', brandsDiscovered: 0,
         perfumesDiscovered: 0, urlsQueued: 0,
         startedAt: new Date().toISOString(), finishedAt: null, error: null,
     };
@@ -229,23 +226,36 @@ router.post('/import/catalog', requireSuperAdmin, async (req, res) => {
 
     setImmediate(async () => {
         try {
-            // 1. Browse ALL perfumes via cursor-based API (no per-brand limit)
-            console.log('[algolia] Browsing full catalog…');
+            // 1. Get all brands via facet API
+            console.log('[algolia] Fetching all brands…');
+            const brandMap = await fetchAllFacetValues('dizajner');
+            const brandNames = Object.keys(brandMap);
+            algoliaImportJob.brandsDiscovered = brandNames.length;
             algoliaImportJob.phase = 'perfumes';
-            const allUrls = await browseAllPerfumes();
-            algoliaImportJob.perfumesDiscovered = allUrls.length;
-            console.log(`[algolia] Browse complete: ${allUrls.length} total perfumes found`);
+            console.log(`[algolia] Found ${brandNames.length} brands`);
 
-            if (!algoliaImportJob.active) return;
-
-            // 2. Filter out already-existing URLs and enqueue
-            algoliaImportJob.phase = 'enqueueing';
+            // 2. For each brand, fetch perfumes using facetFilters (requires only search ACL)
             const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
-            const uniqueNew = [...new Set(allUrls)].filter(u => !existingUrls.has(u));
+            const allUrls = [];
+
+            for (const brand of brandNames) {
+                if (!algoliaImportJob.active) break;
+                try {
+                    const urls = await fetchPerfumesForBrand(brand);
+                    urls.forEach(u => { if (!existingUrls.has(u)) allUrls.push(u); });
+                    algoliaImportJob.perfumesDiscovered += urls.length;
+                } catch (err) {
+                    console.warn(`[algolia] Brand "${brand}": ${err.message}`);
+                }
+            }
+
+            // 3. Enqueue
+            algoliaImportJob.phase = 'enqueueing';
+            const uniqueNew = [...new Set(allUrls)];
             const added = await dataStore.queueEnqueue(uniqueNew, false).catch(() => 0);
             algoliaImportJob.urlsQueued = added;
 
-            console.log(`[algolia] Done: ${allUrls.length} found, ${uniqueNew.length} new, ${added} queued`);
+            console.log(`[algolia] Done: ${algoliaImportJob.perfumesDiscovered} found, ${uniqueNew.length} new, ${added} queued`);
             algoliaImportJob.active = false;
             algoliaImportJob.phase = 'done';
             algoliaImportJob.finishedAt = new Date().toISOString();
