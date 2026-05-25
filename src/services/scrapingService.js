@@ -199,6 +199,17 @@ export const scrapePerfume = async (url) => {
             );
         }
 
+        // Fallback: extract brand from URL slug (/perfume/{brand-slug}/...)
+        if (!perfume.brand) {
+            const urlMatch = url.match(/\/perfume\/([^/]+)\//);
+            if (urlMatch) {
+                perfume.brand = urlMatch[1]
+                    .replace(/-/g, ' ')
+                    .replace(/\b\w/g, c => c.toUpperCase());
+                console.log(`⚠️ Brand not found in HTML, extracted from URL: "${perfume.brand}"`);
+            }
+        }
+
         if (!perfume.brand) {
             throw new Error(
                 'INVALID_DATA: No se pudo extraer la marca del perfume. La página puede estar incompleta o bloqueada.'
