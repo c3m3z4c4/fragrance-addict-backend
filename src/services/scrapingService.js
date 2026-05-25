@@ -29,6 +29,8 @@ export const BROWSER_CONFIG = {
         '--mute-audio',
         '--disable-background-timer-throttling',
         '--disable-renderer-backgrounding',
+        '--no-zygote',              // prevents "Cannot fork" errors on Linux under tight process limits
+        '--disable-crash-reporter', // no crashpad helper process
     ],
 };
 
