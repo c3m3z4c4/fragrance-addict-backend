@@ -39,4 +39,4 @@ COPY . .
 
 EXPOSE 3000
 
-CMD ["node", "src/diag.js"]
+CMD ["node", "src/index.js"]

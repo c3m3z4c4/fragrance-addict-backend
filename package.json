@@ -27,5 +27,8 @@
         "ssh2-sftp-client": "^12.1.1",
         "uuid": "^9.0.1",
         "webdav": "^5.10.0"
+    },
+    "overrides": {
+        "proxy-from-env": "1.1.0"
     }
 }
