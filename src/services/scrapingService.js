@@ -3,7 +3,7 @@ import * as cheerio from 'cheerio';
 import { v4 as uuidv4 } from 'uuid';
 import { cacheService } from './cacheService.js';
 
-const SCRAPE_DELAY = parseInt(process.env.SCRAPE_DELAY_MS) || 3000;
+const SCRAPE_DELAY = parseInt(process.env.SCRAPE_DELAY_MS) || 500;
 
 // Delay entre requests
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -114,17 +114,17 @@ export const scrapePerfume = async (url) => {
         // Esperar a que cargue el contenido principal
         await page.waitForSelector('h1', { timeout: 15000 });
 
-        // Give JS 2s to render dynamic content after DOM is ready
-        await new Promise(r => setTimeout(r, 2000));
+        // Give JS time to render dynamic content after DOM is ready
+        await new Promise(r => setTimeout(r, 800));
 
-        // Also wait for the notes pyramid if present (it lazy-loads on some pages)
-        await page.waitForSelector('#pyramid, [class*="pyramid"], a[href*="/notes/"]', { timeout: 8000 }).catch(() => {});
+        // Wait for notes pyramid if present (lazy-loads on some pages)
+        await page.waitForSelector('#pyramid, [class*="pyramid"], a[href*="/notes/"]', { timeout: 4000 }).catch(() => {});
 
-        // Scroll down to trigger lazy-loaded vote widgets
+        // Scroll to trigger lazy-loaded vote widgets
         await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
-        await new Promise(r => setTimeout(r, 1500));
+        await new Promise(r => setTimeout(r, 500));
         await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, 400));
 
         // Obtener el HTML de la página
         const html = await page.content();

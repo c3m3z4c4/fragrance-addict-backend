@@ -776,6 +776,8 @@ router.get('/queue/status', requireSuperAdmin, async (req, res) => {
         processedThisSession: scrapingQueue.processedThisSession,
         failedThisSession: scrapingQueue.failedThisSession,
         startedAt: scrapingQueue.startedAt,
+        activeWorkers,
+        configuredWorkers: SCRAPE_WORKERS,
         errors: scrapingQueue.errors.slice(-10),
         // Performance metrics
         processingRatePerHour,
@@ -816,59 +818,62 @@ router.delete('/queue', requireSuperAdmin, async (req, res, next) => {
 });
 
 // Background queue processor
-async function processQueue() {
+// Number of parallel scraping workers (tune via SCRAPE_WORKERS env var)
+const SCRAPE_WORKERS = Math.max(1, parseInt(process.env.SCRAPE_WORKERS) || 3);
+// Delay between each worker's requests (ms) — stagger workers slightly
+const BETWEEN_REQUESTS_MS = parseInt(process.env.BETWEEN_REQUESTS_MS) || 3000;
+const RATE_LIMIT_PAUSE_MS = parseInt(process.env.RATE_LIMIT_PAUSE_MS) || 60000;
+
+// Active worker count — workers decrement this when they exit
+let activeWorkers = 0;
+
+async function scrapeWorker(workerId) {
+    activeWorkers++;
     let consecutiveRateLimits = 0;
     const MAX_RATE_LIMIT_RETRIES = 3;
-    const RATE_LIMIT_PAUSE_MS = 120000; // 2 min pause on rate limit
+
+    console.log(`[worker-${workerId}] started`);
 
     while (scrapingQueue.processing) {
-        // ── Dequeue next pending URL from DB ──────────────────────────────────
         const item = await dataStore.queueDequeue().catch(() => null);
+        if (!item) break; // Queue empty
 
-        // No more pending URLs → done
-        if (!item) break;
-
-        // Support both new {url, force} shape and legacy string fallback
         const url = typeof item === 'string' ? item : item.url;
         const force = typeof item === 'string' ? false : (item.force ?? false);
 
         scrapingQueue.current = url;
 
         try {
-            // ── Validate: skip if already scraped & saved (unless force re-scrape) ─
             if (!force) {
                 const alreadyExists = await dataStore.existsBySourceUrl(url).catch(() => false);
                 if (alreadyExists) {
-                    console.log(`⏭️ Already in DB, skipping: ${url}`);
+                    console.log(`[worker-${workerId}] ⏭️ Already in DB: ${url}`);
                     await dataStore.queueMark(url, 'done');
                     scrapingQueue.processedThisSession++;
                     consecutiveRateLimits = 0;
-                    continue; // No delay needed for skip
+                    continue;
                 }
             }
 
-            // ── Scrape ────────────────────────────────────────────────────────
-            console.log(`🔄 Scraping${force ? ' (force)' : ''}: ${url}`);
+            console.log(`[worker-${workerId}] 🔄 Scraping${force ? ' (force)' : ''}: ${url}`);
             const perfume = await scrapePerfume(url);
 
             if (perfume) {
-                // Re-scrape mode: update existing record rather than inserting a duplicate
                 if (force) {
                     const existing = await dataStore.getBySourceUrl(url).catch(() => null);
                     if (existing) {
                         await dataStore.update(existing.id, perfume);
-                        console.log(`🔄 Updated: ${perfume.name}`);
+                        console.log(`[worker-${workerId}] 🔄 Updated: ${perfume.name}`);
                     } else {
                         await dataStore.add(perfume);
-                        console.log(`✅ Saved (new): ${perfume.name}`);
+                        console.log(`[worker-${workerId}] ✅ Saved (new): ${perfume.name}`);
                     }
                 } else {
                     await dataStore.add(perfume);
-                    console.log(`✅ Saved: ${perfume.name}`);
+                    console.log(`[worker-${workerId}] ✅ Saved: ${perfume.name}`);
                 }
                 await dataStore.queueMark(url, 'done');
             } else {
-                // scrapePerfume returned null/undefined (no data)
                 await dataStore.queueMark(url, 'failed', 'No data returned by scraper');
                 scrapingQueue.failedThisSession++;
                 scrapingQueue.errors.push({ url, error: 'No data returned', time: new Date().toISOString() });
@@ -878,50 +883,62 @@ async function processQueue() {
             consecutiveRateLimits = 0;
         } catch (error) {
             const msg = error.message || '';
-            console.error(`❌ Failed: ${url} — ${msg}`);
+            console.error(`[worker-${workerId}] ❌ Failed: ${url} — ${msg}`);
 
-            // Rate limit → put back as pending and wait
             if (msg.includes('RATE_LIMITED') || msg.includes('Too Many Requests')) {
                 consecutiveRateLimits++;
                 await dataStore.queueMark(url, 'pending').catch(() => {});
-                console.warn(`⚠️ Rate limit (${consecutiveRateLimits}/${MAX_RATE_LIMIT_RETRIES})`);
+                console.warn(`[worker-${workerId}] ⚠️ Rate limit (${consecutiveRateLimits}/${MAX_RATE_LIMIT_RETRIES})`);
 
+                const pause = consecutiveRateLimits >= MAX_RATE_LIMIT_RETRIES
+                    ? 5 * 60 * 1000
+                    : RATE_LIMIT_PAUSE_MS;
                 if (consecutiveRateLimits >= MAX_RATE_LIMIT_RETRIES) {
-                    const longPause = 5 * 60 * 1000;
-                    console.warn(`⚠️ Multiple rate limits. Pausing ${longPause / 60000} min then resuming…`);
-                    scrapingQueue.errors.push({ url, error: `Rate limit × ${MAX_RATE_LIMIT_RETRIES}: paused ${longPause / 60000} min`, time: new Date().toISOString() });
+                    console.warn(`[worker-${workerId}] ⚠️ Multiple rate limits. Pausing ${pause / 60000} min…`);
+                    scrapingQueue.errors.push({ url, error: `Rate limit × ${consecutiveRateLimits}: paused ${pause / 60000} min`, time: new Date().toISOString() });
                     consecutiveRateLimits = 0;
-                    await new Promise(r => setTimeout(r, longPause));
-                } else {
-                    await new Promise(r => setTimeout(r, RATE_LIMIT_PAUSE_MS));
                 }
-                continue; // Retry from DB (URL is pending again)
+                await new Promise(r => setTimeout(r, pause));
+                continue;
             }
 
-            // Invalid data → mark failed, skip
             if (msg.includes('INVALID_DATA')) {
-                console.warn(`⏭️ Invalid data: ${url}`);
+                console.warn(`[worker-${workerId}] ⏭️ Invalid data: ${url}`);
                 await dataStore.queueMark(url, 'failed', msg);
                 scrapingQueue.failedThisSession++;
                 scrapingQueue.errors.push({ url, error: msg, time: new Date().toISOString() });
+                if (scrapingQueue.errors.length > 50) scrapingQueue.errors.shift();
                 consecutiveRateLimits = 0;
                 continue;
             }
 
-            // Other errors → mark failed, keep going
             await dataStore.queueMark(url, 'failed', msg);
             scrapingQueue.failedThisSession++;
             scrapingQueue.errors.push({ url, error: msg, time: new Date().toISOString() });
-            if (scrapingQueue.errors.length > 20) scrapingQueue.errors.shift();
+            if (scrapingQueue.errors.length > 50) scrapingQueue.errors.shift();
         }
 
-        // Respectful delay between requests
-        await new Promise(r => setTimeout(r, 15000));
+        await new Promise(r => setTimeout(r, BETWEEN_REQUESTS_MS));
     }
 
-    scrapingQueue.processing = false;
-    scrapingQueue.current = null;
-    console.log(`✅ Queue session done. Processed: ${scrapingQueue.processedThisSession}, Failed: ${scrapingQueue.failedThisSession}`);
+    activeWorkers--;
+    console.log(`[worker-${workerId}] done (${activeWorkers} workers still active)`);
+
+    // Last worker out updates state
+    if (activeWorkers === 0) {
+        scrapingQueue.processing = false;
+        scrapingQueue.current = null;
+        console.log(`✅ Queue session done. Processed: ${scrapingQueue.processedThisSession}, Failed: ${scrapingQueue.failedThisSession}`);
+    }
+}
+
+function processQueue() {
+    const workers = SCRAPE_WORKERS;
+    console.log(`🚀 Starting ${workers} scrape workers (${BETWEEN_REQUESTS_MS}ms between requests each)`);
+    for (let i = 1; i <= workers; i++) {
+        // Stagger worker start by 2s each to avoid all hitting Chromium at once
+        setTimeout(() => scrapeWorker(i), (i - 1) * 2000);
+    }
 }
 
 // GET /api/scrape/incomplete/by-brand - Incomplete perfumes grouped by brand
