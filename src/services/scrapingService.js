@@ -135,17 +135,22 @@ export const scrapePerfume = async (url) => {
         const h1Text = $('h1').first().text().toLowerCase();
         const bodyText = $('body').text().toLowerCase().substring(0, 1000);
 
-        // Detect rate limiting or error pages
+        // Detect rate limiting, Cloudflare challenge, or error pages
         if (
             pageTitle.includes('too many requests') ||
             pageTitle.includes('429') ||
             pageTitle.includes('error') ||
             pageTitle.includes('blocked') ||
+            pageTitle.includes('just a moment') ||   // Cloudflare challenge
+            pageTitle.includes('attention required') ||
             h1Text.includes('too many requests') ||
             h1Text.includes('access denied') ||
+            h1Text.includes('just a moment') ||
             bodyText.includes('too many requests') ||
             bodyText.includes('rate limit') ||
-            bodyText.includes('please try again later')
+            bodyText.includes('please try again later') ||
+            bodyText.includes('cf-browser-verification') ||
+            bodyText.includes('enable javascript and cookies')
         ) {
             throw new Error(
                 'RATE_LIMITED: Fragrantica ha bloqueado temporalmente las peticiones. Intenta más tarde.'
@@ -192,7 +197,9 @@ export const scrapePerfume = async (url) => {
         // Validate required fields before saving
         if (
             !perfume.name ||
-            perfume.name.toLowerCase().includes('too many requests')
+            perfume.name.toLowerCase().includes('too many requests') ||
+            perfume.name.toLowerCase().includes('just a moment') ||
+            perfume.name.toLowerCase().includes('attention required')
         ) {
             throw new Error(
                 'INVALID_DATA: No se pudo extraer el nombre del perfume. La página puede estar bloqueada.'
