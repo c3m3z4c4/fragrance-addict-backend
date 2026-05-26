@@ -45,8 +45,9 @@ let scrapingQueue = {
     current: null,
     processedThisSession: 0,
     failedThisSession: 0,
+    rateLimitedThisSession: 0,
     startedAt: null,
-    errors: [],          // last ~20 errors for display
+    errors: [],          // last ~50 errors for display (includes rate-limit retries)
     // Legacy in-memory list (used only when DB not available)
     urls: [],
     total: 0,
@@ -98,6 +99,7 @@ async function enqueueUrls(urls, autoStart = false, force = false) {
         scrapingQueue.startedAt = new Date().toISOString();
         scrapingQueue.processedThisSession = 0;
         scrapingQueue.failedThisSession = 0;
+        scrapingQueue.rateLimitedThisSession = 0;
         scrapingQueue.errors = [];
         processQueue();
     }
@@ -345,6 +347,7 @@ router.post('/brands', requireSuperAdmin, async (req, res, next) => {
             scrapingQueue.startedAt = new Date().toISOString();
             scrapingQueue.processedThisSession = 0;
             scrapingQueue.failedThisSession = 0;
+            scrapingQueue.rateLimitedThisSession = 0;
             scrapingQueue.errors = [];
             processQueue();
         }
@@ -722,6 +725,7 @@ router.post('/queue/start', requireSuperAdmin, async (req, res, next) => {
         scrapingQueue.startedAt = new Date().toISOString();
         scrapingQueue.processedThisSession = 0;
         scrapingQueue.failedThisSession = 0;
+        scrapingQueue.rateLimitedThisSession = 0;
         scrapingQueue.errors = [];
 
         console.log(`🚀 Starting queue: ${stats.pending} pending URLs`);
@@ -775,6 +779,7 @@ router.get('/queue/status', requireSuperAdmin, async (req, res) => {
         // Session info
         processedThisSession: scrapingQueue.processedThisSession,
         failedThisSession: scrapingQueue.failedThisSession,
+        rateLimitedThisSession: scrapingQueue.rateLimitedThisSession,
         startedAt: scrapingQueue.startedAt,
         activeWorkers,
         configuredWorkers: SCRAPE_WORKERS,
@@ -876,7 +881,8 @@ async function scrapeWorker(workerId) {
             } else {
                 await dataStore.queueMark(url, 'failed', 'No data returned by scraper');
                 scrapingQueue.failedThisSession++;
-                scrapingQueue.errors.push({ url, error: 'No data returned', time: new Date().toISOString() });
+                scrapingQueue.errors.push({ url, error: 'No data returned', type: 'error', time: new Date().toISOString() });
+                if (scrapingQueue.errors.length > 50) scrapingQueue.errors.shift();
             }
 
             scrapingQueue.processedThisSession++;
@@ -887,15 +893,18 @@ async function scrapeWorker(workerId) {
 
             if (msg.includes('RATE_LIMITED') || msg.includes('Too Many Requests')) {
                 consecutiveRateLimits++;
+                scrapingQueue.rateLimitedThisSession++;
                 await dataStore.queueMark(url, 'pending').catch(() => {});
                 console.warn(`[worker-${workerId}] ⚠️ Rate limit (${consecutiveRateLimits}/${MAX_RATE_LIMIT_RETRIES})`);
 
                 const pause = consecutiveRateLimits >= MAX_RATE_LIMIT_RETRIES
                     ? 5 * 60 * 1000
                     : RATE_LIMIT_PAUSE_MS;
+                const pauseMin = Math.round(pause / 60000);
+                scrapingQueue.errors.push({ url, error: `Rate limit (reintentando en ${pauseMin > 0 ? pauseMin + ' min' : 'breve'})`, type: 'rate_limit', time: new Date().toISOString() });
+                if (scrapingQueue.errors.length > 50) scrapingQueue.errors.shift();
                 if (consecutiveRateLimits >= MAX_RATE_LIMIT_RETRIES) {
-                    console.warn(`[worker-${workerId}] ⚠️ Multiple rate limits. Pausing ${pause / 60000} min…`);
-                    scrapingQueue.errors.push({ url, error: `Rate limit × ${consecutiveRateLimits}: paused ${pause / 60000} min`, time: new Date().toISOString() });
+                    console.warn(`[worker-${workerId}] ⚠️ Multiple rate limits. Pausing ${pauseMin} min…`);
                     consecutiveRateLimits = 0;
                 }
                 await new Promise(r => setTimeout(r, pause));
@@ -906,7 +915,7 @@ async function scrapeWorker(workerId) {
                 console.warn(`[worker-${workerId}] ⏭️ Invalid data: ${url}`);
                 await dataStore.queueMark(url, 'failed', msg);
                 scrapingQueue.failedThisSession++;
-                scrapingQueue.errors.push({ url, error: msg, time: new Date().toISOString() });
+                scrapingQueue.errors.push({ url, error: msg, type: 'error', time: new Date().toISOString() });
                 if (scrapingQueue.errors.length > 50) scrapingQueue.errors.shift();
                 consecutiveRateLimits = 0;
                 continue;
@@ -914,7 +923,7 @@ async function scrapeWorker(workerId) {
 
             await dataStore.queueMark(url, 'failed', msg);
             scrapingQueue.failedThisSession++;
-            scrapingQueue.errors.push({ url, error: msg, time: new Date().toISOString() });
+            scrapingQueue.errors.push({ url, error: msg, type: 'error', time: new Date().toISOString() });
             if (scrapingQueue.errors.length > 50) scrapingQueue.errors.shift();
         }
 
@@ -1154,6 +1163,7 @@ router.post('/reset', requireSuperAdmin, async (req, res, next) => {
         scrapingQueue.current = null;
         scrapingQueue.processedThisSession = 0;
         scrapingQueue.failedThisSession = 0;
+        scrapingQueue.rateLimitedThisSession = 0;
         scrapingQueue.errors = [];
         await dataStore.queueClear().catch(() => {});
 
