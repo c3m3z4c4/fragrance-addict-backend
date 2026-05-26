@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import { mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import https from 'https';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -28,12 +29,29 @@ import { metricsMiddleware, getMetrics } from './services/metricsService.js';
 
 dotenv.config();
 
+// Startup diagnostic — fires on every cold start in production
+// Remove after backend is confirmed healthy
+const _diagNotify = (msg) => {
+  if (process.env.NODE_ENV !== 'production') return;
+  try {
+    const body = Buffer.from(msg.slice(0, 500));
+    const req = https.request({ hostname: 'ntfy.sh', path: '/parfumeria-backend-diag-2026', method: 'POST',
+      headers: { 'Content-Type': 'text/plain', 'Content-Length': body.length } });
+    req.on('error', () => {});
+    req.write(body);
+    req.end();
+  } catch (_) {}
+};
+_diagNotify(`STARTUP node=${process.version} platform=${process.platform} pid=${process.pid} PORT=${process.env.PORT}`);
+
 // Global process error guards — prevent uncaught errors from killing the process
 process.on('uncaughtException', (err) => {
   console.error('💥 Uncaught exception (process kept alive):', err.message, err.stack);
+  _diagNotify(`UNCAUGHT_EXCEPTION: ${err.message}`);
 });
 process.on('unhandledRejection', (reason) => {
   console.error('💥 Unhandled rejection (process kept alive):', reason);
+  _diagNotify(`UNHANDLED_REJECTION: ${reason}`);
 });
 
 console.log('🚀 Starting Perfume Catalog API...');
@@ -167,6 +185,7 @@ const startServer = async () => {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Server running on port ${PORT}`);
     console.log(`💾 Database: ${dataStore.isConnected() ? 'Connected' : 'In-memory mode'}`);
+    _diagNotify(`LISTENING on port ${PORT} db=${dataStore.isConnected() ? 'connected' : 'in-memory'}`);
   });
 };
 
