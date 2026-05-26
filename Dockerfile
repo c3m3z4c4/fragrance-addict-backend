@@ -39,9 +39,4 @@ COPY . .
 
 EXPOSE 3000
 
-# Run as non-root user for better security posture
-RUN groupadd -r appuser && useradd -r -g appuser -G audio,video appuser \
-    && chown -R appuser:appuser /app
-USER appuser
-
 CMD ["node", "src/index.js"]
