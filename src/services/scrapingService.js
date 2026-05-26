@@ -12,7 +12,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export const BROWSER_CONFIG = {
     headless: 'new',
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    protocolTimeout: 60000, // CDP command timeout (Network.enable, etc.)
+    protocolTimeout: 60000,
     args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -20,7 +20,6 @@ export const BROWSER_CONFIG = {
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
         '--window-size=1280,800',
-        '--disable-blink-features=AutomationControlled',
         '--disable-extensions',
         '--disable-default-apps',
         '--disable-background-networking',
@@ -29,8 +28,15 @@ export const BROWSER_CONFIG = {
         '--mute-audio',
         '--disable-background-timer-throttling',
         '--disable-renderer-backgrounding',
-        '--no-zygote',              // prevents "Cannot fork" errors on Linux under tight process limits
-        '--disable-crash-reporter', // no crashpad helper process
+        '--no-zygote',
+        '--disable-crash-reporter',
+        // Limit renderer processes — reduces process count from ~30 to ~5 per browser
+        '--renderer-process-limit=2',
+        '--disable-features=site-per-process,Translate,TranslateUI',
+        // Disable unnecessary network services that make outbound connections
+        '--disable-component-update',
+        '--disable-domain-reliability',
+        '--no-pings',
     ],
 };
 

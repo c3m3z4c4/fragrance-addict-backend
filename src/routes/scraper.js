@@ -819,7 +819,7 @@ router.delete('/queue', requireSuperAdmin, async (req, res, next) => {
 
 // Background queue processor
 // Number of parallel scraping workers (tune via SCRAPE_WORKERS env var)
-const SCRAPE_WORKERS = Math.max(1, parseInt(process.env.SCRAPE_WORKERS) || 3);
+const SCRAPE_WORKERS = Math.max(1, parseInt(process.env.SCRAPE_WORKERS) || 2);
 // Delay between each worker's requests (ms) — stagger workers slightly
 const BETWEEN_REQUESTS_MS = parseInt(process.env.BETWEEN_REQUESTS_MS) || 3000;
 const RATE_LIMIT_PAUSE_MS = parseInt(process.env.RATE_LIMIT_PAUSE_MS) || 60000;

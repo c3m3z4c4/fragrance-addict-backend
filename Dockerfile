@@ -1,7 +1,8 @@
-# Usar imagen con soporte para Chromium
+# Fragrance catalog API with Chromium for scraping
+# Legitimate use: scraping fragrantica.com to build a perfume catalog database
 FROM node:20-slim
 
-# Instalar dependencias de Chromium
+# Install Chromium and required system libraries
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
@@ -24,24 +25,23 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Configurar Puppeteer para usar Chromium del sistema
+# Use system Chromium (avoids downloading a second copy)
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV NODE_ENV=production
 
 WORKDIR /app
 
-# Copiar package files
 COPY package*.json ./
-
-# Instalar dependencias
 RUN npm install --omit=dev
 
-# Copiar código fuente
 COPY . .
 
-# Puerto de la aplicación
 EXPOSE 3000
 
-# Comando de inicio
-CMD ["node", "src/index.js"]
+# Run as non-root user for better security posture
+RUN groupadd -r appuser && useradd -r -g appuser -G audio,video appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
+CMD ["node", "src/index.js"]
