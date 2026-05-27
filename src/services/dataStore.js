@@ -264,6 +264,13 @@ export const initDatabase = async () => {
         ALTER TABLE scrape_queue ADD COLUMN force BOOLEAN DEFAULT FALSE;
       END IF;
     END $$;
+    -- Migration: add available_at for rate-limit deferral
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='scrape_queue' AND column_name='available_at') THEN
+        ALTER TABLE scrape_queue ADD COLUMN available_at TIMESTAMPTZ DEFAULT NOW();
+      END IF;
+    END $$;
+    CREATE INDEX IF NOT EXISTS idx_scrape_queue_available ON scrape_queue(available_at) WHERE status = 'pending';
 
     -- Migration: deduplicate brands table (keep row with logo_url, or earliest created)
     DO $$ BEGIN
@@ -637,7 +644,8 @@ export const dataStore = {
             WHERE id = (
                 SELECT id FROM scrape_queue
                 WHERE status = 'pending'
-                ORDER BY created_at ASC
+                  AND (available_at IS NULL OR available_at <= NOW())
+                ORDER BY available_at ASC NULLS FIRST, created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
@@ -645,6 +653,15 @@ export const dataStore = {
         `);
         if (!result.rows[0]) return null;
         return { url: result.rows[0].url, force: result.rows[0].force ?? false };
+    },
+
+    // Re-queue a rate-limited URL with a delay before it can be picked up again
+    queueDefer: async (url, delayMs) => {
+        if (!isDatabaseConnected) return;
+        await pool.query(
+            `UPDATE scrape_queue SET status = 'pending', available_at = NOW() + ($1 * INTERVAL '1 millisecond'), updated_at = NOW() WHERE url = $2`,
+            [delayMs, url]
+        );
     },
 
     // Mark a queued URL as done / failed

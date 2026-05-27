@@ -828,7 +828,7 @@ router.delete('/queue', requireSuperAdmin, async (req, res, next) => {
 // Number of parallel scraping workers (tune via SCRAPE_WORKERS env var)
 const SCRAPE_WORKERS = Math.max(1, parseInt(process.env.SCRAPE_WORKERS) || 2);
 // Delay between each worker's requests (ms) — stagger workers slightly
-const BETWEEN_REQUESTS_MS = parseInt(process.env.BETWEEN_REQUESTS_MS) || 3000;
+const BETWEEN_REQUESTS_MS = parseInt(process.env.BETWEEN_REQUESTS_MS) || 15000;
 const RATE_LIMIT_PAUSE_MS = parseInt(process.env.RATE_LIMIT_PAUSE_MS) || 60000;
 
 // Active worker count — workers decrement this when they exit
@@ -896,20 +896,25 @@ async function scrapeWorker(workerId) {
             if (msg.includes('RATE_LIMITED') || msg.includes('Too Many Requests')) {
                 consecutiveRateLimits++;
                 scrapingQueue.rateLimitedThisSession++;
-                await dataStore.queueMark(url, 'pending').catch(() => {});
-                console.warn(`[worker-${workerId}] ⚠️ Rate limit (${consecutiveRateLimits}/${MAX_RATE_LIMIT_RETRIES})`);
 
-                const pause = consecutiveRateLimits >= MAX_RATE_LIMIT_RETRIES
-                    ? 5 * 60 * 1000
-                    : RATE_LIMIT_PAUSE_MS;
-                const pauseMin = Math.round(pause / 60000);
-                scrapingQueue.errors.push({ url, error: `Rate limit (reintentando en ${pauseMin > 0 ? pauseMin + ' min' : 'breve'})`, type: 'rate_limit', time: new Date().toISOString() });
+                // Exponential backoff: 1min → 2min → 5min → 10min
+                const backoffSteps = [60000, 120000, 300000, 600000];
+                const deferMs = backoffSteps[Math.min(consecutiveRateLimits - 1, backoffSteps.length - 1)];
+                // Defer URL in DB — won't be picked up until after deferMs
+                await dataStore.queueDefer(url, deferMs).catch(() => dataStore.queueMark(url, 'pending').catch(() => {}));
+
+                const deferMin = Math.round(deferMs / 60000);
+                console.warn(`[worker-${workerId}] ⚠️ Rate limit ×${consecutiveRateLimits} — URL deferred ${deferMin}m`);
+                scrapingQueue.errors.push({ url, error: `Rate limit (disponible en ${deferMin} min)`, type: 'rate_limit', time: new Date().toISOString() });
                 if (scrapingQueue.errors.length > 50) scrapingQueue.errors.shift();
+
+                // Also pause the worker to avoid hammering
+                const workerPause = Math.min(deferMs, RATE_LIMIT_PAUSE_MS);
                 if (consecutiveRateLimits >= MAX_RATE_LIMIT_RETRIES) {
-                    console.warn(`[worker-${workerId}] ⚠️ Multiple rate limits. Pausing ${pauseMin} min…`);
+                    console.warn(`[worker-${workerId}] ⚠️ Multiple rate limits — pausing worker ${workerPause / 60000}min`);
                     consecutiveRateLimits = 0;
                 }
-                await new Promise(r => setTimeout(r, pause));
+                await new Promise(r => setTimeout(r, workerPause));
                 continue;
             }
 
