@@ -67,16 +67,16 @@ export const scrapePerfume = async (url) => {
             // Wait for Cloudflare JS challenge to auto-clear (stealth plugin handles fingerprint)
             const cleared = await waitForCloudflare(page, 45000);
             if (!cleared) {
-                // Capture diagnostic state — title, h1, body snippet — to tell IP-ban from Turnstile
                 const diag = await page.evaluate(() => ({
                     title: document.title || '',
                     h1: document.querySelector('h1')?.textContent?.trim().slice(0, 120) || '',
                     bodyStart: document.body?.innerText?.trim().slice(0, 300) || '',
                     hasTurnstile: !!document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]'),
-                    hasCfRay: document.cookie.includes('__cf') || !!document.querySelector('meta[name="cf-2fa-verify"]'),
+                    hasCfCookie: document.cookie.includes('__cf'),
+                    url: location.href,
                 })).catch(() => ({}));
                 console.warn(`🛡️  Cloudflare did not clear for ${url}`, diag);
-                throw new Error('RATE_LIMITED: Cloudflare challenge did not clear within 45s');
+                throw new Error(`RATE_LIMITED: CF challenge stuck. DIAG=${JSON.stringify(diag)}`);
             }
 
             await page.waitForSelector('h1[itemprop="name"]', { timeout: 20000 }).catch(() => {});
@@ -89,9 +89,10 @@ export const scrapePerfume = async (url) => {
                 const diag = await page.evaluate(() => ({
                     title: document.title || '',
                     bodyStart: document.body?.innerText?.trim().slice(0, 200) || '',
+                    url: location.href,
                 })).catch(() => ({}));
                 console.warn(`🚫 H1 missing for ${url}`, diag);
-                throw new Error('INVALID_DATA: H1 not found after load');
+                throw new Error(`INVALID_DATA: H1 not found. DIAG=${JSON.stringify(diag)}`);
             }
 
             await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
