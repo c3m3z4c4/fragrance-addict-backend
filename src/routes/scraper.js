@@ -3,6 +3,7 @@ import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { browserPool } from '../services/browserPool.js';
+import { getPerfumeViaAlgolia, fetchAlgoliaPerfume } from '../services/algoliaService.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
@@ -108,31 +109,60 @@ async function enqueueUrls(urls, autoStart = false, force = false) {
 }
 
 // GET /api/scrape/perfume?url=... - Scrapear un perfume
+// Tries Algolia first (bypasses CF). Falls back to Puppeteer scrape only if Algolia
+// has no record or the key is missing. `?source=scrape` forces Puppeteer.
 router.get('/perfume', requireSuperAdmin, scrapeLimiter, async (req, res, next) => {
     try {
-        const { url, save } = req.query;
+        const { url, save, source } = req.query;
 
-        if (!url) {
-            return next(new ApiError('URL requerida', 400));
+        if (!url) return next(new ApiError('URL requerida', 400));
+        if (!isValidUrl(url)) return next(new ApiError('URL inválida', 400));
+
+        console.log(`📥 Solicitud de scraping: ${url} (source=${source || 'auto'})`);
+
+        let perfume = null;
+        let usedSource = null;
+        const forceScrape = source === 'scrape';
+        const forceAlgolia = source === 'algolia';
+
+        if (!forceScrape) {
+            try {
+                perfume = await getPerfumeViaAlgolia(url);
+                if (perfume) {
+                    usedSource = 'algolia';
+                    console.log(`✅ Algolia hit: ${perfume.name}`);
+                }
+            } catch (err) {
+                if (forceAlgolia) throw err;
+                console.warn(`⚠️ Algolia lookup failed (${err.message}) — falling back to scrape`);
+            }
         }
 
-        if (!isValidUrl(url)) {
-            return next(new ApiError('URL inválida', 400));
+        if (!perfume && !forceAlgolia) {
+            perfume = await scrapePerfume(url);
+            usedSource = 'scrape';
         }
 
-        console.log(`📥 Solicitud de scraping: ${url}`);
-
-        const perfume = await scrapePerfume(url);
-
-        // Guardar automáticamente si se indica
         if (save === 'true' && perfume) {
             await dataStore.add(perfume);
             console.log(`💾 Perfume guardado: ${perfume.name}`);
         }
 
-        res.json({ success: true, data: perfume });
+        res.json({ success: true, source: usedSource, data: perfume });
     } catch (error) {
         next(new ApiError(error.message, 500));
+    }
+});
+
+// GET /api/scrape/algolia/raw?url=... — diagnostic: dump raw Algolia record for inspection
+router.get('/algolia/raw', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { url } = req.query;
+        if (!url) return next(new ApiError('URL requerida', 400));
+        const record = await fetchAlgoliaPerfume(url);
+        res.json({ success: !!record, record });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
     }
 });
 
@@ -848,7 +878,29 @@ async function scrapeWorker(workerId) {
             }
 
             console.log(`[worker-${workerId}] 🔄 Scraping${force ? ' (force)' : ''}: ${url}`);
-            const perfume = await scrapePerfume(url);
+
+            // Try Algolia first — bypasses Cloudflare entirely. Falls through to
+            // Puppeteer scrape on any failure (missing key, no record, network error).
+            let perfume = null;
+            let dataSource = null;
+            try {
+                perfume = await getPerfumeViaAlgolia(url);
+                if (perfume) {
+                    dataSource = 'algolia';
+                    console.log(`[worker-${workerId}] 📚 Algolia: ${perfume.name}`);
+                }
+            } catch (err) {
+                // ALGOLIA_KEY_MISSING is expected when no key configured — silent.
+                if (!String(err.message).includes('ALGOLIA_KEY_MISSING')) {
+                    console.warn(`[worker-${workerId}] Algolia failed (${err.message}) — falling back`);
+                }
+            }
+
+            if (!perfume) {
+                perfume = await scrapePerfume(url);
+                dataSource = 'scrape';
+            }
+            void dataSource;
 
             if (perfume) {
                 if (force) {
