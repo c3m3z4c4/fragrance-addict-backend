@@ -4,6 +4,7 @@ import multer from 'multer';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { browserPool } from '../services/browserPool.js';
 import { getPerfumeViaAlgolia, fetchAlgoliaPerfume } from '../services/algoliaService.js';
+import { enrichPerfumeWithAI } from '../services/aiEnrichmentService.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
@@ -161,6 +162,46 @@ router.get('/algolia/raw', requireSuperAdmin, async (req, res, next) => {
         if (!url) return next(new ApiError('URL requerida', 400));
         const record = await fetchAlgoliaPerfume(url);
         res.json({ success: !!record, record });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
+    }
+});
+
+// POST /api/scrape/enrich-ai — AI-enrich a perfume by id, url, or inline record.
+// Body: { perfumeId? | url? | perfume? , save? = true, minConfidence? = 0.6 }
+router.post('/enrich-ai', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const { perfumeId, url, perfume: inline, save = true, minConfidence } = req.body || {};
+
+        let perfume = inline || null;
+        if (!perfume && perfumeId) {
+            perfume = await dataStore.getById(perfumeId).catch(() => null);
+        }
+        if (!perfume && url) {
+            perfume = await dataStore.getBySourceUrl(url).catch(() => null);
+            if (!perfume) {
+                // Pull basic record from Algolia so we have name/brand to feed AI
+                perfume = await getPerfumeViaAlgolia(url).catch(() => null);
+            }
+        }
+        if (!perfume) return next(new ApiError('No se pudo resolver el perfume (perfumeId|url|perfume requerido)', 400));
+
+        const enriched = await enrichPerfumeWithAI(perfume, { minConfidence });
+
+        if (save && enriched.aiEnriched) {
+            if (perfume.id && await dataStore.getById(perfume.id).catch(() => null)) {
+                await dataStore.update(perfume.id, enriched);
+            } else {
+                await dataStore.add(enriched);
+            }
+        }
+
+        res.json({
+            success: true,
+            aiConfidence: enriched.aiConfidence,
+            aiEnriched: enriched.aiEnriched,
+            data: enriched,
+        });
     } catch (err) {
         next(new ApiError(err.message, 500));
     }
