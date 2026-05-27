@@ -1,7 +1,8 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
-import { scrapePerfume, BROWSER_CONFIG, addStealthScripts } from '../services/scrapingService.js';
+import { scrapePerfume } from '../services/scrapingService.js';
+import { browserPool } from '../services/browserPool.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
@@ -190,31 +191,21 @@ router.post('/batch', requireSuperAdmin, async (req, res, next) => {
 // ─── Shared helper: fetch all perfume URLs from a Fragrantica brand page ───────
 
 async function fetchBrandUrls(brand, limit = 500) {
-    const puppeteer = (await import('puppeteer')).default;
-    let browser = null;
-    try {
-    browser = await puppeteer.launch(BROWSER_CONFIG);
+    const brandSlug = brand.trim()
+        .replace(/\s+/g, '-')
+        .replace(/['']/g, '')
+        .replace(/&/g, 'and');
 
-        const page = await browser.newPage();
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        );
+    const brandUrl = `https://www.fragrantica.com/designers/${brandSlug}.html`;
+    console.log(`🔍 Fetching brand page: ${brandUrl}`);
 
-        const brandSlug = brand.trim()
-            .replace(/\s+/g, '-')
-            .replace(/['']/g, '')
-            .replace(/&/g, 'and');
-
-        const brandUrl = `https://www.fragrantica.com/designers/${brandSlug}.html`;
-        console.log(`🔍 Fetching brand page: ${brandUrl}`);
-
-        // domcontentloaded is enough — we only need links, not full network idle
+    return browserPool.withPage(async (page) => {
+        // Logo discovery needs natural image dimensions — allow images for this short visit
+        // by overriding interception. Skip: keep blocked, logo is detected by URL pattern not size.
         await page.goto(brandUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.waitForSelector('a[href*="/perfume/"]', { timeout: 15000 }).catch(() => {});
 
-        // Extract brand logo — Fragrantica stores brand images in their CDN
         const logoUrl = await page.evaluate(() => {
-            // Priority order: brand-specific CDN path, then any fimgs.net image
             const selectors = [
                 'img[src*="/dizajneri/"]',
                 'img[src*="fimgs.net"][src*="/mdimg/"]',
@@ -224,9 +215,8 @@ async function fetchBrandUrls(brand, limit = 500) {
             ];
             for (const sel of selectors) {
                 const img = document.querySelector(sel);
-                if (img?.src && img.naturalWidth > 50) return img.src;
+                if (img?.src) return img.src;
             }
-            // Fallback: first fimgs.net image (Fragrantica CDN)
             const anyFimgs = document.querySelector('img[src*="fimgs.net"]');
             return anyFimgs?.src || null;
         }).catch(() => null);
@@ -239,9 +229,7 @@ async function fetchBrandUrls(brand, limit = 500) {
         urls = [...new Set(urls)].slice(0, limit);
         console.log(`  Found ${urls.length} URLs for brand "${brand}", logo: ${logoUrl ? 'yes' : 'no'}`);
         return { urls, brandUrl, logoUrl };
-    } finally {
-        if (browser) await browser.close().catch(() => {});
-    }
+    });
 }
 
 // POST /api/scrape/brand - Scraping automático de una marca completa
@@ -461,15 +449,9 @@ router.post('/sitemap', requireSuperAdmin, async (req, res, next) => {
             `📥 Fetching sitemap for brand: ${brand || 'all'}, limit: ${limit}`
         );
 
-        const puppeteer = (await import('puppeteer')).default;
-        const browser = await puppeteer.launch(BROWSER_CONFIG);
-
-        const page = await browser.newPage();
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        );
-
         let urls = [];
+        const page = await browserPool.getPage();
+        try {
 
         if (brand) {
             // Fragrantica brand URLs formats:
@@ -559,7 +541,7 @@ router.post('/sitemap', requireSuperAdmin, async (req, res, next) => {
                 }
             } catch (navError) {
                 console.error(`Navigation error: ${navError.message}`);
-                await browser.close().catch(() => {});
+                await page.close().catch(() => {});
                 return res.json({
                     success: false,
                     error: `Could not load brand page for "${brand}". Make sure the brand name matches exactly as shown on Fragrantica (e.g., "Dior", "Tom Ford", "Chanel").`,
@@ -606,7 +588,9 @@ router.post('/sitemap', requireSuperAdmin, async (req, res, next) => {
             }
         }
 
-        await browser.close().catch(() => {});
+        } finally {
+            await page.close().catch(() => {});
+        }
 
         // Limit results
         urls = urls.slice(0, parseInt(limit));
@@ -825,10 +809,11 @@ router.delete('/queue', requireSuperAdmin, async (req, res, next) => {
 });
 
 // Background queue processor
-// Number of parallel scraping workers (tune via SCRAPE_WORKERS env var)
-const SCRAPE_WORKERS = Math.max(1, parseInt(process.env.SCRAPE_WORKERS) || 2);
+// Number of parallel scraping workers — default 1 to keep CPU footprint low on shared hosting.
+// The shared browser pool serializes well at 1; raising this multiplies page count, not browser count.
+const SCRAPE_WORKERS = Math.max(1, parseInt(process.env.SCRAPE_WORKERS) || 1);
 // Delay between each worker's requests (ms) — stagger workers slightly
-const BETWEEN_REQUESTS_MS = parseInt(process.env.BETWEEN_REQUESTS_MS) || 15000;
+const BETWEEN_REQUESTS_MS = parseInt(process.env.BETWEEN_REQUESTS_MS) || 8000;
 const RATE_LIMIT_PAUSE_MS = parseInt(process.env.RATE_LIMIT_PAUSE_MS) || 60000;
 
 // Active worker count — workers decrement this when they exit
@@ -1544,15 +1529,11 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
         res.json({ success: true, status: 'started', total: brandsToProcess.length });
 
         setImmediate(async () => {
-            const puppeteer = (await import('puppeteer')).default;
-            let browser = null;
             try {
-                browser = await puppeteer.launch(BROWSER_CONFIG);
-
                 for (const brand of brandsToProcess) {
                     if (!logoFetchJob.running) break;
                     try {
-                        const { logoUrl, source } = await fetchBrandLogoMultiSource(browser, brand.name);
+                        const { logoUrl, source } = await fetchBrandLogoMultiSource(brand.name);
                         if (logoUrl) {
                             await dataStore.upsertBrand(brand.name, logoUrl, null);
                             logoFetchJob.results.push({ name: brand.name, logoUrl, source, status: 'updated' });
@@ -1568,13 +1549,11 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
                         console.warn(`⚠️  Logo error "${brand.name}": ${err.message}`);
                     }
                     logoFetchJob.processed++;
-                    // Respectful delay between brands
                     await new Promise(r => setTimeout(r, 1200));
                 }
             } catch (err) {
                 console.error('Logo fetch job crashed:', err.message);
             } finally {
-                if (browser) await browser.close().catch(() => {});
                 logoFetchJob.running = false;
                 logoFetchJob.completedAt = new Date().toISOString();
                 console.log(`✅ Logo fetch done: ${logoFetchJob.updated} updated, ${logoFetchJob.failed} not found`);
@@ -1594,21 +1573,17 @@ router.get('/brands/logos/status', requireSuperAdmin, (req, res) => {
 // Tries sources in order: Clearbit → DuckDuckGo → Parfumo → Fragrantica (multiple slugs)
 // Returns { logoUrl, source } or { logoUrl: null, source: null }
 
-async function fetchBrandLogoMultiSource(browser, brandName) {
-    // --- Source 1: Clearbit Logo API (fast, no browser, works for major brands) ---
+async function fetchBrandLogoMultiSource(brandName) {
     const clearbitUrl = await tryLogoFromClearbit(brandName);
     if (clearbitUrl) return { logoUrl: clearbitUrl, source: 'clearbit' };
 
-    // --- Source 2: DuckDuckGo Instant Answer (entity image for known brands) ---
     const ddgUrl = await tryLogoFromDuckDuckGo(brandName);
     if (ddgUrl) return { logoUrl: ddgUrl, source: 'duckduckgo' };
 
-    // --- Source 3: Parfumo (fragrance-specific, no anti-bot) ---
-    const parfumoUrl = await tryLogoFromParfumo(browser, brandName);
+    const parfumoUrl = await tryLogoFromParfumo(brandName);
     if (parfumoUrl) return { logoUrl: parfumoUrl, source: 'parfumo' };
 
-    // --- Source 4: Fragrantica (multiple slug patterns) ---
-    const fragranticaUrl = await tryLogoFromFragrantica(browser, brandName);
+    const fragranticaUrl = await tryLogoFromFragrantica(brandName);
     if (fragranticaUrl) return { logoUrl: fragranticaUrl, source: 'fragrantica' };
 
     return { logoUrl: null, source: null };
@@ -1671,50 +1646,44 @@ async function tryLogoFromDuckDuckGo(brandName) {
     return null;
 }
 
-// Parfumo — fragrance-specific site, friendlier to scraping than Fragrantica
-async function tryLogoFromParfumo(browser, brandName) {
-    const page = await browser.newPage();
-    try {
-        await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-        const slug = brandName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
-        await page.goto(`https://www.parfumo.com/Perfumes/${slug}`, {
-            waitUntil: 'domcontentloaded', timeout: 20000,
-        });
-        await new Promise(r => setTimeout(r, 800));
-        const logoUrl = await page.evaluate(() => {
-            const selectors = [
-                '.brand-logo img', '.house-logo img',
-                'img[class*="logo"]', 'img[alt*="logo"]',
-                '.brand img', 'header img',
-            ];
-            for (const sel of selectors) {
-                const img = document.querySelector(sel);
-                if (img?.src && img.naturalWidth > 30) return img.src;
-            }
-            return null;
-        }).catch(() => null);
-        return logoUrl;
-    } catch { return null; }
-    finally { await page.close().catch(() => {}); }
+// Parfumo — fragrance-specific site, friendlier to scraping than Fragrantica.
+// Uses browser pool with images allowed (logo selectors rely on src patterns; naturalWidth check removed).
+async function tryLogoFromParfumo(brandName) {
+    return browserPool.withPage({ blockResources: false, stealth: false }, async (page) => {
+        try {
+            const slug = brandName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '');
+            await page.goto(`https://www.parfumo.com/Perfumes/${slug}`, {
+                waitUntil: 'domcontentloaded', timeout: 20000,
+            });
+            await new Promise(r => setTimeout(r, 600));
+            return await page.evaluate(() => {
+                const selectors = [
+                    '.brand-logo img', '.house-logo img',
+                    'img[class*="logo"]', 'img[alt*="logo"]',
+                    '.brand img', 'header img',
+                ];
+                for (const sel of selectors) {
+                    const img = document.querySelector(sel);
+                    if (img?.src) return img.src;
+                }
+                return null;
+            }).catch(() => null);
+        } catch { return null; }
+    });
 }
 
 // Fragrantica — tries multiple slug patterns, most authoritative for fragrance brands
-async function tryLogoFromFragrantica(browser, brandName) {
-    const page = await browser.newPage();
-    try {
-        await addStealthScripts(page);
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-
+async function tryLogoFromFragrantica(brandName) {
+    return browserPool.withPage({ blockResources: false }, async (page) => {
         for (const slug of brandSlugs(brandName)) {
             try {
                 const url = `https://www.fragrantica.com/designers/${slug}.html`;
                 const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
                 if (!resp || resp.status() === 404) continue;
 
-                await new Promise(r => setTimeout(r, 1200));
+                await new Promise(r => setTimeout(r, 800));
 
                 const logoUrl = await page.evaluate(() => {
-                    // Fragrantica stores brand images in /dizajneri/ path or fimgs CDN
                     const selectors = [
                         'img[src*="/dizajneri/"]',
                         'img[src*="fimgs.net"][src*="brand"]',
@@ -1726,11 +1695,10 @@ async function tryLogoFromFragrantica(browser, brandName) {
                     ];
                     for (const sel of selectors) {
                         const img = document.querySelector(sel);
-                        if (img?.src && img.naturalWidth > 40 && img.naturalHeight > 20) return img.src;
+                        if (img?.src) return img.src;
                     }
-                    // Last resort: any fimgs.net image on the page
                     const imgs = [...document.querySelectorAll('img[src*="fimgs.net"]')];
-                    const best = imgs.find(i => i.naturalWidth > 40 && !i.src.includes('/thumbs/'));
+                    const best = imgs.find(i => !i.src.includes('/thumbs/'));
                     return best?.src || null;
                 }).catch(() => null);
 
@@ -1738,7 +1706,7 @@ async function tryLogoFromFragrantica(browser, brandName) {
             } catch { /* try next slug */ }
         }
         return null;
-    } finally { await page.close().catch(() => {}); }
+    });
 }
 
 // GET /api/scrape/brands/without-logos — list of brand names with no logo in DB

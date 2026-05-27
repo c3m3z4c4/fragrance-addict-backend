@@ -30,6 +30,13 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV NODE_ENV=production
 
+# Cap Node heap to keep memory predictable under load.
+# Cap scraping concurrency and pacing so shared hosts (Hostinger) don't flag CPU bursts.
+ENV NODE_OPTIONS=--max-old-space-size=512
+ENV SCRAPE_WORKERS=1
+ENV BETWEEN_REQUESTS_MS=8000
+ENV BROWSER_RESTART_AFTER_PAGES=30
+
 WORKDIR /app
 
 COPY package*.json ./

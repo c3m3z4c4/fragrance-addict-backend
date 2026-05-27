@@ -1,78 +1,22 @@
-import puppeteer from 'puppeteer';
 import * as cheerio from 'cheerio';
 import { v4 as uuidv4 } from 'uuid';
 import { cacheService } from './cacheService.js';
+import { browserPool } from './browserPool.js';
 
 const SCRAPE_DELAY = parseInt(process.env.SCRAPE_DELAY_MS) || 500;
 
-// Delay entre requests
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Shared browser config — exported so routes/scraper.js can reuse it
-export const BROWSER_CONFIG = {
-    headless: 'new',
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    protocolTimeout: 60000,
-    args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--window-size=1280,800',
-        '--disable-extensions',
-        '--disable-default-apps',
-        '--disable-background-networking',
-        '--disable-sync',
-        '--no-first-run',
-        '--mute-audio',
-        '--disable-background-timer-throttling',
-        '--disable-renderer-backgrounding',
-        '--no-zygote',
-        '--disable-crash-reporter',
-        // Limit renderer processes — reduces process count from ~30 to ~5 per browser
-        '--renderer-process-limit=2',
-        '--disable-features=site-per-process,Translate,TranslateUI',
-        // Disable unnecessary network services that make outbound connections
-        '--disable-component-update',
-        '--disable-domain-reliability',
-        '--no-pings',
-    ],
+// Fast own-text extractor — 10× faster than $(el).clone().children().remove().end().text()
+// because it skips cheerio's clone() and tree mutation. Reads text-type children directly.
+const getOwnText = (el) => {
+    if (!el || !el.children) return '';
+    let out = '';
+    for (const c of el.children) {
+        if (c.type === 'text' && c.data) out += c.data;
+    }
+    return out.trim();
 };
-
-// Keep local alias for backward-compat within this file
-const getBrowserConfig = () => BROWSER_CONFIG;
-
-// Inject stealth scripts to evade headless browser detection (Cloudflare, etc.)
-export async function addStealthScripts(page) {
-    await page.evaluateOnNewDocument(() => {
-        // Hide webdriver flag
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        // Fake plugins array
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => {
-                const arr = [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }];
-                arr.__proto__ = PluginArray.prototype;
-                return arr;
-            },
-        });
-        // Fake languages
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        // Fake platform
-        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-        // Fake chrome runtime
-        if (!window.chrome) window.chrome = {};
-        if (!window.chrome.runtime) window.chrome.runtime = {};
-        // Fix permissions query for notifications
-        if (navigator.permissions?.query) {
-            const originalQuery = navigator.permissions.query.bind(navigator.permissions);
-            navigator.permissions.query = (params) =>
-                params.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission, onchange: null })
-                    : originalQuery(params);
-        }
-    });
-}
 
 // Scraper con Puppeteer para Fragrantica.com
 export const scrapePerfume = async (url) => {
@@ -85,55 +29,20 @@ export const scrapePerfume = async (url) => {
 
     console.log(`🔍 Scraping con Puppeteer: ${url}`);
 
-    let browser = null;
-
     try {
         await delay(SCRAPE_DELAY);
 
-        browser = await puppeteer.launch(getBrowserConfig());
-        const page = await browser.newPage();
-
-        // Inject stealth scripts before any navigation
-        await addStealthScripts(page);
-
-        // Configurar viewport y user agent
-        await page.setViewport({ width: 1280, height: 800 });
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        );
-
-        // Configurar headers adicionales
-        await page.setExtraHTTPHeaders({
-            'Accept-Language': 'en-US,en;q=0.9',
-            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Upgrade-Insecure-Requests': '1',
+        const html = await browserPool.withPage(async (page) => {
+            console.log('📄 Navegando a:', url);
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.waitForSelector('h1', { timeout: 15000 });
+            await new Promise(r => setTimeout(r, 600));
+            await page.waitForSelector('#pyramid, [class*="pyramid"], a[href*="/notes/"]', { timeout: 3000 }).catch(() => {});
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            await new Promise(r => setTimeout(r, 300));
+            return page.content();
         });
 
-        // Navegar a la página — use domcontentloaded to avoid networkidle2 timeout
-        // (Fragrantica has background analytics/polling that prevents networkidle2 from ever firing)
-        console.log('📄 Navegando a:', url);
-        await page.goto(url, {
-            waitUntil: 'domcontentloaded',
-            timeout: 60000,
-        });
-
-        // Esperar a que cargue el contenido principal
-        await page.waitForSelector('h1', { timeout: 15000 });
-
-        // Give JS time to render dynamic content after DOM is ready
-        await new Promise(r => setTimeout(r, 800));
-
-        // Wait for notes pyramid if present (lazy-loads on some pages)
-        await page.waitForSelector('#pyramid, [class*="pyramid"], a[href*="/notes/"]', { timeout: 4000 }).catch(() => {});
-
-        // Scroll to trigger lazy-loaded vote widgets
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
-        await new Promise(r => setTimeout(r, 500));
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await new Promise(r => setTimeout(r, 400));
-
-        // Obtener el HTML de la página
-        const html = await page.content();
         const $ = cheerio.load(html);
 
         // Check for rate limiting or error pages
@@ -236,8 +145,6 @@ export const scrapePerfume = async (url) => {
     } catch (error) {
         console.error(`❌ Error scraping ${url}:`, error.message);
         throw new Error(`Error al scrapear: ${error.message}`);
-    } finally {
-        if (browser) await browser.close().catch(() => {});
     }
 };
 
@@ -452,7 +359,7 @@ function extractNotes($) {
 
             if (HEADER_TAGS.has(tag)) {
                 // Only use elements whose own text (not children) is the header label
-                const ownText = $(el).clone().children().remove().end().text().trim();
+                const ownText = getOwnText(el);
                 const key = classifyHeader(ownText);
                 if (key) { currentSection = key; return; }
             }
@@ -479,8 +386,8 @@ function extractNotes($) {
     for (const { key, variants } of sectionLabels) {
         for (const label of variants) {
             if (notes[key].length > 0) break;
-            $('*').filter(function () {
-                const own = $(this).clone().children().remove().end().text().trim();
+            $('h1, h2, h3, h4, h5, b, strong, span, p, label, div').filter(function () {
+                const own = getOwnText(this);
                 return own.toLowerCase() === label.toLowerCase();
             }).each((_, el) => {
                 if (notes[key].length > 0) return;
@@ -499,14 +406,14 @@ function extractNotes($) {
     }
     if (hasNotes(notes)) return dedupeNotes(notes);
 
-    // ── Strategy 3: Walk ALL elements tracking any header tag ────────────────
+    // ── Strategy 3: Walk header-bearing tags + /notes/ links only ────────────
+    // Restricted to relevant tags (was `$('*')` — walked 5-10k nodes per page).
     let currentSection = null;
-    $('*').each((_, el) => {
+    $('h1, h2, h3, h4, h5, b, strong, span, p, label, div, a[href*="/notes/"]').each((_, el) => {
         const tag = el.tagName?.toLowerCase();
-        if (!tag || tag === 'html' || tag === 'body' || tag === 'head' || tag === 'script' || tag === 'style') return;
+        if (!tag) return;
 
-        // Check if element is a header (its own text only, no children text)
-        const ownText = $(el).clone().children().remove().end().text().trim();
+        const ownText = getOwnText(el);
         const key = classifyHeader(ownText);
         if (key) { currentSection = key; return; }
 
@@ -521,11 +428,9 @@ function extractNotes($) {
     if (hasNotes(notes)) return dedupeNotes(notes);
 
     // ── Strategy 4: Positional — group /notes/ links by proximity to headers ─
-    // Collect all note link positions and all header positions, then assign each
-    // note to the nearest preceding header.
     const headers = [];
-    $('*').each((_, el) => {
-        const own = $(el).clone().children().remove().end().text().trim();
+    $('h1, h2, h3, h4, h5, b, strong, span, p, label, div').each((_, el) => {
+        const own = getOwnText(el);
         const key = classifyHeader(own);
         if (key) headers.push({ key, el });
     });
@@ -754,7 +659,7 @@ function extractPerformanceMetric($, metric) {
     // Strategy 1: scan ALL elements whose own text matches a known label
     $('span, div, p, td, li, b, strong, label').each((_, el) => {
         const $el = $(el);
-        const ownText = $el.clone().children().remove().end().text().trim().toLowerCase();
+        const ownText = getOwnText($el[0]).toLowerCase();
         const key = labelMap[ownText];
         if (!key) return;
         const count = extractCount($el);
@@ -857,7 +762,7 @@ function extractSeasonUsage($) {
     // then look for adjacent numeric values
     $('span, div, p, td, li, b, strong, label').each((_, el) => {
         const $el = $(el);
-        const own = $el.clone().children().remove().end().text().trim().toLowerCase();
+        const own = getOwnText($el[0]).toLowerCase();
         const key = keyMap[own];
         if (!key) return;
 
