@@ -793,6 +793,8 @@ router.get('/queue/status', requireSuperAdmin, async (req, res) => {
         brandImportJob: { ...brandImportJob, results: brandImportJob.results.slice(-50) },
         // Algolia import job
         algoliaJob: getAlgoliaJobState(),
+        // Brand logo fetch job
+        logoFetchJob: { ...logoFetchJob, results: logoFetchJob.results.slice(-30) },
     });
 });
 
@@ -1442,6 +1444,7 @@ router.delete('/duplicates', requireSuperAdmin, async (req, res, next) => {
 // ─── Brand logo fetch job tracker (in-memory) ────────────────────────────────
 let logoFetchJob = {
     running: false,
+    source: 'db',
     total: 0,
     processed: 0,
     updated: 0,
@@ -1461,16 +1464,61 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
             return res.json({ success: true, status: 'already_running', job: logoFetchJob });
         }
 
-        const { force = false } = req.body;
+        const { force = false, source = 'db' } = req.body;
 
-        // Query brands table directly to know which ones truly have no logo_url saved
-        const allBrands = await dataStore.getBrands();
-        const brandsWithSavedLogos = await dataStore.getBrandsWithSavedLogos();
-        const savedLogoSet = new Set(brandsWithSavedLogos.map(b => b.name.toLowerCase()));
+        let brandsToProcess;
 
-        const brandsToProcess = force
-            ? allBrands.filter(b => b.name)
-            : allBrands.filter(b => b.name && !savedLogoSet.has(b.name.toLowerCase()));
+        if (source === 'algolia') {
+            const algoliaKey = process.env.ALGOLIA_API_KEY;
+            if (!algoliaKey) {
+                return res.json({ success: false, error: 'Algolia API key not configured' });
+            }
+            // Fetch all brand names from Algolia facet API
+            const ALGOLIA_APP_ID = 'FGVI612DFZ';
+            const ALGOLIA_INDEX = 'fragrantica_perfumes';
+            const algoliaBase = `https://${ALGOLIA_APP_ID.toLowerCase()}-dsn.algolia.net`;
+            const allBrandNames = new Set();
+            const prefixes = 'abcdefghijklmnopqrstuvwxyz0123456789'.split('').concat(['']);
+            for (const prefix of prefixes) {
+                try {
+                    const resp = await fetch(
+                        `${algoliaBase}/1/indexes/${ALGOLIA_INDEX}/facets/dizajner/query`,
+                        {
+                            method: 'POST',
+                            headers: {
+                                'X-Algolia-Application-Id': ALGOLIA_APP_ID,
+                                'X-Algolia-API-Key': algoliaKey,
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({ facetQuery: prefix, maxFacetHits: 100 }),
+                            signal: AbortSignal.timeout(10000),
+                        }
+                    );
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        for (const hit of (data.facetHits || [])) allBrandNames.add(hit.value);
+                    }
+                    await new Promise(r => setTimeout(r, 120));
+                } catch { /* ignore prefix errors */ }
+            }
+            if (allBrandNames.size === 0) {
+                return res.json({ success: false, error: 'No brands found in Algolia — check API key' });
+            }
+            const brandsWithSavedLogos = await dataStore.getBrandsWithSavedLogos();
+            const savedLogoSet = new Set(brandsWithSavedLogos.map(b => b.name.toLowerCase()));
+            const names = [...allBrandNames];
+            brandsToProcess = force
+                ? names.map(name => ({ name }))
+                : names.filter(name => !savedLogoSet.has(name.toLowerCase())).map(name => ({ name }));
+        } else {
+            // Query brands table directly to know which ones truly have no logo_url saved
+            const allBrands = await dataStore.getBrands();
+            const brandsWithSavedLogos = await dataStore.getBrandsWithSavedLogos();
+            const savedLogoSet = new Set(brandsWithSavedLogos.map(b => b.name.toLowerCase()));
+            brandsToProcess = force
+                ? allBrands.filter(b => b.name)
+                : allBrands.filter(b => b.name && !savedLogoSet.has(b.name.toLowerCase()));
+        }
 
         if (brandsToProcess.length === 0) {
             return res.json({ success: true, status: 'done', total: 0, updated: 0, failed: 0, results: [], message: 'All brands already have logos.' });
@@ -1478,6 +1526,7 @@ router.post('/brands/logos', requireSuperAdmin, async (req, res, next) => {
 
         logoFetchJob = {
             running: true,
+            source,
             total: brandsToProcess.length,
             processed: 0,
             updated: 0,
