@@ -64,23 +64,36 @@ export const scrapePerfume = async (url) => {
             console.log('📄 Navegando a:', url);
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // Wait out Cloudflare challenge if present (Fragrantica uses CF aggressively)
-            const cleared = await waitForCloudflare(page, 25000);
+            // Wait for Cloudflare JS challenge to auto-clear (stealth plugin handles fingerprint)
+            const cleared = await waitForCloudflare(page, 45000);
             if (!cleared) {
-                throw new Error('RATE_LIMITED: Cloudflare challenge did not clear within 25s');
+                // Capture diagnostic state — title, h1, body snippet — to tell IP-ban from Turnstile
+                const diag = await page.evaluate(() => ({
+                    title: document.title || '',
+                    h1: document.querySelector('h1')?.textContent?.trim().slice(0, 120) || '',
+                    bodyStart: document.body?.innerText?.trim().slice(0, 300) || '',
+                    hasTurnstile: !!document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]'),
+                    hasCfRay: document.cookie.includes('__cf') || !!document.querySelector('meta[name="cf-2fa-verify"]'),
+                })).catch(() => ({}));
+                console.warn(`🛡️  Cloudflare did not clear for ${url}`, diag);
+                throw new Error('RATE_LIMITED: Cloudflare challenge did not clear within 45s');
             }
 
-            // Wait for the REAL perfume H1 (itemprop="name"), not generic h1 (which appears on challenge pages too).
             await page.waitForSelector('h1[itemprop="name"]', { timeout: 20000 }).catch(() => {});
 
-            // If itemprop="name" missing, fall back to any h1 with reasonable content
             const ready = await page.evaluate(() => {
                 const h1 = document.querySelector('h1[itemprop="name"]') || document.querySelector('h1');
                 return !!(h1 && h1.textContent && h1.textContent.trim().length > 2);
             });
-            if (!ready) throw new Error('INVALID_DATA: H1 not found after load');
+            if (!ready) {
+                const diag = await page.evaluate(() => ({
+                    title: document.title || '',
+                    bodyStart: document.body?.innerText?.trim().slice(0, 200) || '',
+                })).catch(() => ({}));
+                console.warn(`🚫 H1 missing for ${url}`, diag);
+                throw new Error('INVALID_DATA: H1 not found after load');
+            }
 
-            // Trigger lazy-loaded sections (notes pyramid, vote widgets)
             await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
             await new Promise(r => setTimeout(r, 400));
             await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));

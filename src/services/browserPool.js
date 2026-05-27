@@ -1,4 +1,19 @@
-import puppeteer from 'puppeteer';
+import puppeteerCore from 'puppeteer';
+import puppeteerExtra from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+
+// Wire the stealth plugin into puppeteer-extra. This patches dozens of headless
+// fingerprints (CDP Runtime.enable leak, navigator.webdriver, plugins, codecs,
+// hardware concurrency, iframe contentWindow, etc.) that Cloudflare Turnstile checks.
+const stealth = StealthPlugin();
+// Disable a few sub-evasions that occasionally trip up legit sites
+stealth.enabledEvasions.delete('user-agent-override');
+puppeteerExtra.use(stealth);
+
+// puppeteer-extra delegates the actual binary launch to the wrapped module.
+// Point it at the same `puppeteer` package we already depend on.
+const puppeteer = puppeteerExtra;
+void puppeteerCore;
 
 // Block these resource types — saves CPU, RAM, bandwidth, and renders pages faster.
 // Images/fonts/css/media are not needed for HTML scraping.
@@ -147,7 +162,7 @@ class BrowserPool {
         this.pagesServed = 0;
     }
 
-    async getPage({ blockResources = true, stealth = true } = {}) {
+    async getPage({ blockResources = true, stealth = false } = {}) {
         const browser = await this.getBrowser();
         this.pagesServed++;
         const page = await browser.newPage();
@@ -157,6 +172,10 @@ class BrowserPool {
             'Accept-Language': 'en-US,en;q=0.9',
             Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Upgrade-Insecure-Requests': '1',
+            // Hints that real Chrome sends — make request fingerprint match
+            'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="124", "Google Chrome";v="124"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
         });
 
         if (blockResources) {
@@ -164,12 +183,18 @@ class BrowserPool {
             page.on('request', (req) => {
                 const type = req.resourceType();
                 const url = req.url();
+                // Never block Cloudflare challenge assets — needed to clear the JS challenge
+                if (url.includes('challenges.cloudflare.com') || url.includes('cdn-cgi/challenge-platform')) {
+                    return req.continue().catch(() => {});
+                }
                 if (BLOCKED_RESOURCE_TYPES.has(type)) return req.abort().catch(() => {});
                 if (type !== 'document' && SHOULD_BLOCK_URL(url)) return req.abort().catch(() => {});
                 return req.continue().catch(() => {});
             });
         }
 
+        // puppeteer-extra-plugin-stealth handles fingerprint spoofing at the browser level.
+        // injectStealth() remains available for callers that explicitly need extra masking.
         if (stealth) await injectStealth(page);
 
         return page;
@@ -264,21 +289,26 @@ export async function injectStealth(page) {
 }
 
 // Wait for Cloudflare challenge to clear. Returns true if page is real, false if still challenged.
-export async function waitForCloudflare(page, maxWaitMs = 30000) {
+// Default 45s — Turnstile JS challenge in headless can take 15-30s to auto-solve even with stealth.
+export async function waitForCloudflare(page, maxWaitMs = 45000) {
     const start = Date.now();
+    let lastTitle = '';
     while (Date.now() - start < maxWaitMs) {
-        const challenged = await page.evaluate(() => {
+        const state = await page.evaluate(() => {
             const t = (document.title || '').toLowerCase();
             const h1 = (document.querySelector('h1')?.textContent || '').toLowerCase();
-            return t.includes('just a moment') ||
+            const challenged = t.includes('just a moment') ||
                    t.includes('attention required') ||
                    t.includes('checking your browser') ||
                    h1.includes('just a moment') ||
-                   !!document.querySelector('#challenge-form, #challenge-running, .cf-browser-verification');
-        }).catch(() => false);
-        if (!challenged) return true;
-        await new Promise(r => setTimeout(r, 1500));
+                   !!document.querySelector('#challenge-form, #challenge-running, .cf-browser-verification, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]');
+            return { challenged, title: document.title || '' };
+        }).catch(() => ({ challenged: false, title: '' }));
+        lastTitle = state.title;
+        if (!state.challenged) return true;
+        await new Promise(r => setTimeout(r, 2000));
     }
+    console.warn(`⏱️  Cloudflare did NOT clear after ${maxWaitMs}ms. Final title: "${lastTitle}"`);
     return false;
 }
 
