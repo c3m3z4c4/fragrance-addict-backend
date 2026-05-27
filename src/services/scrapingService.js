@@ -1,7 +1,7 @@
 import * as cheerio from 'cheerio';
 import { v4 as uuidv4 } from 'uuid';
 import { cacheService } from './cacheService.js';
-import { browserPool } from './browserPool.js';
+import { browserPool, waitForCloudflare } from './browserPool.js';
 
 const SCRAPE_DELAY = parseInt(process.env.SCRAPE_DELAY_MS) || 500;
 
@@ -17,6 +17,34 @@ const getOwnText = (el) => {
     }
     return out.trim();
 };
+
+// Parse all <script type="application/ld+json"> blocks and return the first Product object found.
+// Fragrantica embeds schema.org Product JSON-LD with name, brand, image, aggregateRating, etc.
+// This is the most stable extraction path — selectors change, JSON-LD rarely does.
+function extractJsonLd($) {
+    const blocks = [];
+    $('script[type="application/ld+json"]').each((_, el) => {
+        const txt = $(el).contents().text() || $(el).text();
+        if (!txt) return;
+        try {
+            const parsed = JSON.parse(txt);
+            const items = Array.isArray(parsed) ? parsed : [parsed];
+            for (const item of items) {
+                if (!item || typeof item !== 'object') continue;
+                // Handle @graph wrappers
+                if (Array.isArray(item['@graph'])) {
+                    for (const g of item['@graph']) blocks.push(g);
+                } else {
+                    blocks.push(item);
+                }
+            }
+        } catch { /* malformed JSON-LD — skip */ }
+    });
+    // Prefer Product, fall back to anything with a name + brand
+    const product = blocks.find(b => b && (b['@type'] === 'Product' || b['@type']?.includes?.('Product')));
+    if (product) return product;
+    return blocks.find(b => b && b.name && (b.brand || b.manufacturer)) || null;
+}
 
 // Scraper con Puppeteer para Fragrantica.com
 export const scrapePerfume = async (url) => {
@@ -35,11 +63,30 @@ export const scrapePerfume = async (url) => {
         const html = await browserPool.withPage(async (page) => {
             console.log('📄 Navegando a:', url);
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            await page.waitForSelector('h1', { timeout: 15000 });
-            await new Promise(r => setTimeout(r, 600));
-            await page.waitForSelector('#pyramid, [class*="pyramid"], a[href*="/notes/"]', { timeout: 3000 }).catch(() => {});
+
+            // Wait out Cloudflare challenge if present (Fragrantica uses CF aggressively)
+            const cleared = await waitForCloudflare(page, 25000);
+            if (!cleared) {
+                throw new Error('RATE_LIMITED: Cloudflare challenge did not clear within 25s');
+            }
+
+            // Wait for the REAL perfume H1 (itemprop="name"), not generic h1 (which appears on challenge pages too).
+            await page.waitForSelector('h1[itemprop="name"]', { timeout: 20000 }).catch(() => {});
+
+            // If itemprop="name" missing, fall back to any h1 with reasonable content
+            const ready = await page.evaluate(() => {
+                const h1 = document.querySelector('h1[itemprop="name"]') || document.querySelector('h1');
+                return !!(h1 && h1.textContent && h1.textContent.trim().length > 2);
+            });
+            if (!ready) throw new Error('INVALID_DATA: H1 not found after load');
+
+            // Trigger lazy-loaded sections (notes pyramid, vote widgets)
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+            await new Promise(r => setTimeout(r, 400));
             await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            await page.waitForSelector('a[href*="/notes/"], [class*="accord-bar"]', { timeout: 5000 }).catch(() => {});
             await new Promise(r => setTimeout(r, 300));
+
             return page.content();
         });
 
@@ -72,22 +119,25 @@ export const scrapePerfume = async (url) => {
             );
         }
 
-        // Extraer datos usando selectores de Fragrantica
+        // JSON-LD is the most reliable source — parse once, reuse across extractors
+        const ld = extractJsonLd($);
+        if (ld) console.log('🔖 JSON-LD found:', ld['@type'] || 'unknown type');
+
         const perfumerData = extractPerfumerData($);
         const perfume = {
             id: uuidv4(),
-            name: extractName($),
-            brand: extractBrand($),
-            year: extractYear($),
+            name: extractName($, ld),
+            brand: extractBrand($, ld),
+            year: extractYear($, ld),
             perfumer: perfumerData.name,
             perfumerImageUrl: perfumerData.imageUrl,
             gender: extractGender($),
             concentration: extractConcentration($),
             notes: extractNotes($),
             accords: extractAccords($),
-            description: extractDescription($),
-            imageUrl: extractImage($),
-            rating: extractRating($),
+            description: extractDescription($, ld),
+            imageUrl: extractImage($, ld),
+            rating: extractRating($, ld),
             longevity: extractPerformanceMetric($, 'longevity'),
             sillage: extractPerformanceMetric($, 'sillage'),
             seasonUsage: extractSeasonUsage($),
@@ -149,7 +199,15 @@ export const scrapePerfume = async (url) => {
 };
 
 // Extraer nombre del perfume
-function extractName($) {
+function extractName($, ld) {
+    // JSON-LD first — most stable across Fragrantica template changes
+    if (ld?.name && typeof ld.name === 'string') {
+        const brandName = typeof ld.brand === 'string' ? ld.brand : (ld.brand?.name || '');
+        let n = ld.name.trim().replace(/\s+for\s+(men|women|women and men)\s*$/i, '').trim();
+        if (brandName && n.endsWith(brandName)) n = n.slice(0, -brandName.length).trim();
+        if (n) return n;
+    }
+
     const h1Text = $('h1[itemprop="name"]').text().trim();
     if (h1Text) {
         // Remover el género (for men, for women) y la marca
@@ -179,7 +237,16 @@ function extractName($) {
 }
 
 // Extraer marca
-function extractBrand($) {
+function extractBrand($, ld) {
+    if (ld?.brand) {
+        const b = typeof ld.brand === 'string' ? ld.brand : (ld.brand.name || ld.brand['@name']);
+        if (b && typeof b === 'string') return b.trim();
+    }
+    if (ld?.manufacturer) {
+        const m = typeof ld.manufacturer === 'string' ? ld.manufacturer : ld.manufacturer.name;
+        if (m) return m.trim();
+    }
+
     // Selector principal de Fragrantica
     const brand =
         $('p[itemprop="brand"] span[itemprop="name"]').text().trim() ||
@@ -198,7 +265,17 @@ function extractBrand($) {
 }
 
 // Extraer año de lanzamiento
-function extractYear($) {
+function extractYear($, ld) {
+    // JSON-LD: releaseDate or productionDate (ISO 8601)
+    const ldDate = ld?.releaseDate || ld?.productionDate || ld?.dateCreated;
+    if (ldDate) {
+        const m = String(ldDate).match(/(\d{4})/);
+        if (m) {
+            const y = parseInt(m[1]);
+            if (y >= 1900 && y <= new Date().getFullYear()) return y;
+        }
+    }
+
     const bodyText = $('body').text();
 
     // Buscar patrones comunes en Fragrantica
@@ -528,7 +605,11 @@ function extractAccords($) {
 }
 
 // Extraer descripción
-function extractDescription($) {
+function extractDescription($, ld) {
+    if (ld?.description && typeof ld.description === 'string' && ld.description.trim().length > 50) {
+        return ld.description.trim();
+    }
+
     // Fragrantica tiene la descripción en varios posibles lugares
     const selectors = [
         '[itemprop="description"]',
@@ -568,7 +649,16 @@ function extractDescription($) {
 }
 
 // Extraer imagen principal
-function extractImage($) {
+function extractImage($, ld) {
+    // JSON-LD: image can be string or array of strings/objects
+    if (ld?.image) {
+        const candidates = Array.isArray(ld.image) ? ld.image : [ld.image];
+        for (const c of candidates) {
+            const url = typeof c === 'string' ? c : (c?.url || c?.contentUrl);
+            if (url && /^https?:\/\//.test(url)) return url;
+        }
+    }
+
     // Imagen principal del perfume en Fragrantica
     const imgSelectors = [
         'img[itemprop="image"]',
@@ -817,7 +907,19 @@ function extractSeasonUsage($) {
     return normalized;
 }
 
-function extractRating($) {
+function extractRating($, ld) {
+    // JSON-LD aggregateRating — most reliable
+    const ar = ld?.aggregateRating || ld?.review?.reviewRating;
+    if (ar) {
+        const v = parseFloat(ar.ratingValue ?? ar.value);
+        if (!isNaN(v)) {
+            // Normalize to 0-5 scale if source is 0-10
+            const best = parseFloat(ar.bestRating ?? 5);
+            const normalized = best > 5 ? (v / best) * 5 : v;
+            return Math.round(normalized * 10) / 10;
+        }
+    }
+
     // Fragrantica muestra ratings de diferentes formas
     const ratingSelectors = [
         '[itemprop="ratingValue"]',

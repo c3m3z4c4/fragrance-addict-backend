@@ -193,18 +193,45 @@ class BrowserPool {
 
 export async function injectStealth(page) {
     await page.evaluateOnNewDocument(() => {
+        // navigator.webdriver
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        delete Object.getPrototypeOf(navigator).webdriver;
+
+        // plugins + mimeTypes
         Object.defineProperty(navigator, 'plugins', {
             get: () => {
-                const arr = [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }];
+                const arr = [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+                ];
                 arr.__proto__ = PluginArray.prototype;
                 return arr;
             },
         });
+        Object.defineProperty(navigator, 'mimeTypes', {
+            get: () => {
+                const arr = [{ type: 'application/pdf', suffixes: 'pdf', description: '' }];
+                arr.__proto__ = MimeTypeArray.prototype;
+                return arr;
+            },
+        });
+
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
         Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-        if (!window.chrome) window.chrome = {};
-        if (!window.chrome.runtime) window.chrome.runtime = {};
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+        Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+
+        // chrome runtime spoof
+        window.chrome = {
+            runtime: {},
+            loadTimes: () => ({}),
+            csi: () => ({}),
+            app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
+        };
+
+        // permissions API
         if (navigator.permissions?.query) {
             const originalQuery = navigator.permissions.query.bind(navigator.permissions);
             navigator.permissions.query = (params) =>
@@ -212,7 +239,47 @@ export async function injectStealth(page) {
                     ? Promise.resolve({ state: Notification.permission, onchange: null })
                     : originalQuery(params);
         }
+
+        // WebGL vendor/renderer spoof — Cloudflare fingerprints these
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function (param) {
+            if (param === 37445) return 'Intel Inc.';          // UNMASKED_VENDOR_WEBGL
+            if (param === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+            return getParameter.apply(this, [param]);
+        };
+        if (typeof WebGL2RenderingContext !== 'undefined') {
+            const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+            WebGL2RenderingContext.prototype.getParameter = function (param) {
+                if (param === 37445) return 'Intel Inc.';
+                if (param === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter2.apply(this, [param]);
+            };
+        }
+
+        // Hide automation indicators from window
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
     });
+}
+
+// Wait for Cloudflare challenge to clear. Returns true if page is real, false if still challenged.
+export async function waitForCloudflare(page, maxWaitMs = 30000) {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+        const challenged = await page.evaluate(() => {
+            const t = (document.title || '').toLowerCase();
+            const h1 = (document.querySelector('h1')?.textContent || '').toLowerCase();
+            return t.includes('just a moment') ||
+                   t.includes('attention required') ||
+                   t.includes('checking your browser') ||
+                   h1.includes('just a moment') ||
+                   !!document.querySelector('#challenge-form, #challenge-running, .cf-browser-verification');
+        }).catch(() => false);
+        if (!challenged) return true;
+        await new Promise(r => setTimeout(r, 1500));
+    }
+    return false;
 }
 
 export const browserPool = new BrowserPool();
