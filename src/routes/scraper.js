@@ -4,7 +4,8 @@ import multer from 'multer';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { browserPool } from '../services/browserPool.js';
 import { getPerfumeViaAlgolia, fetchAlgoliaPerfume } from '../services/algoliaService.js';
-import { enrichPerfumeWithAI } from '../services/aiEnrichmentService.js';
+import { enrichPerfumeWithAI, ENRICHABLE_FIELDS, DEFAULT_MIN_CONFIDENCE } from '../services/aiEnrichmentService.js';
+import { getActiveProvider } from './ai.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
@@ -167,11 +168,24 @@ router.get('/algolia/raw', requireSuperAdmin, async (req, res, next) => {
     }
 });
 
+// GET /api/scrape/enrich-ai/config — what's configured for AI enrichment
+router.get('/enrich-ai/config', requireSuperAdmin, async (_req, res) => {
+    const active = await getActiveProvider().catch(() => null);
+    res.json({
+        success: true,
+        configured: !!active,
+        provider: active?.provider || null,
+        model: active?.model || null,
+        minConfidence: DEFAULT_MIN_CONFIDENCE,
+        enrichableFields: ENRICHABLE_FIELDS,
+    });
+});
+
 // POST /api/scrape/enrich-ai — AI-enrich a perfume by id, url, or inline record.
-// Body: { perfumeId? | url? | perfume? , save? = true, minConfidence? = 0.6 }
+// Body: { perfumeId? | url? | perfume?, save?=true, minConfidence?, fields?, provider?, model? }
 router.post('/enrich-ai', requireSuperAdmin, async (req, res, next) => {
     try {
-        const { perfumeId, url, perfume: inline, save = true, minConfidence } = req.body || {};
+        const { perfumeId, url, perfume: inline, save = true, minConfidence, fields, provider, model } = req.body || {};
 
         let perfume = inline || null;
         if (!perfume && perfumeId) {
@@ -180,13 +194,12 @@ router.post('/enrich-ai', requireSuperAdmin, async (req, res, next) => {
         if (!perfume && url) {
             perfume = await dataStore.getBySourceUrl(url).catch(() => null);
             if (!perfume) {
-                // Pull basic record from Algolia so we have name/brand to feed AI
                 perfume = await getPerfumeViaAlgolia(url).catch(() => null);
             }
         }
         if (!perfume) return next(new ApiError('No se pudo resolver el perfume (perfumeId|url|perfume requerido)', 400));
 
-        const enriched = await enrichPerfumeWithAI(perfume, { minConfidence });
+        const enriched = await enrichPerfumeWithAI(perfume, { minConfidence, fields, provider, model });
 
         if (save && enriched.aiEnriched) {
             if (perfume.id && await dataStore.getById(perfume.id).catch(() => null)) {
@@ -200,11 +213,84 @@ router.post('/enrich-ai', requireSuperAdmin, async (req, res, next) => {
             success: true,
             aiConfidence: enriched.aiConfidence,
             aiEnriched: enriched.aiEnriched,
+            aiProvider: enriched.aiProvider,
+            aiModel: enriched.aiModel,
             data: enriched,
         });
     } catch (err) {
         next(new ApiError(err.message, 500));
     }
+});
+
+// POST /api/scrape/enrich-ai/bulk — enrich many perfumes that are missing notes/accords.
+// Body: { limit?=50, minConfidence?, fields?, provider?, model? }. Runs in background.
+let enrichBulkJob = { running: false, total: 0, processed: 0, enriched: 0, skipped: 0, failed: 0, startedAt: null, finishedAt: null };
+
+router.post('/enrich-ai/bulk', requireSuperAdmin, async (req, res, next) => {
+    try {
+        if (enrichBulkJob.running) {
+            return res.json({ success: false, error: 'Bulk enrichment already running', job: enrichBulkJob });
+        }
+        const { limit = 50, minConfidence, fields, provider, model } = req.body || {};
+
+        const active = await getActiveProvider().catch(() => null);
+        if (!active && !(provider && req.body?.apiKey)) {
+            return next(new ApiError('No active AI provider configured', 503));
+        }
+
+        // Perfumes with empty notes are the enrichment targets
+        const candidates = await dataStore.getIncomplete({ limit: parseInt(limit) }).catch(() => []);
+        if (!candidates.length) {
+            return res.json({ success: true, message: 'No incomplete perfumes found', job: enrichBulkJob });
+        }
+
+        enrichBulkJob = {
+            running: true, total: candidates.length, processed: 0, enriched: 0,
+            skipped: 0, failed: 0, startedAt: new Date().toISOString(), finishedAt: null,
+        };
+        res.json({ success: true, status: 'started', total: candidates.length });
+
+        setImmediate(async () => {
+            for (const p of candidates) {
+                if (!enrichBulkJob.running) break;
+                try {
+                    const enriched = await enrichPerfumeWithAI(p, { minConfidence, fields, provider, model });
+                    if (enriched.aiEnriched) {
+                        await dataStore.update(p.id, enriched);
+                        enrichBulkJob.enriched++;
+                    } else {
+                        enrichBulkJob.skipped++;
+                    }
+                } catch (err) {
+                    enrichBulkJob.failed++;
+                    console.warn(`[enrich-ai] "${p.name}": ${err.message}`);
+                    // Stop early on quota/auth errors — no point hammering
+                    if (/429|quota|401|invalid/i.test(err.message)) {
+                        console.warn('[enrich-ai] Aborting bulk — provider error');
+                        break;
+                    }
+                }
+                enrichBulkJob.processed++;
+                await new Promise(r => setTimeout(r, 600));
+            }
+            enrichBulkJob.running = false;
+            enrichBulkJob.finishedAt = new Date().toISOString();
+            console.log(`[enrich-ai] Bulk done: ${enrichBulkJob.enriched} enriched, ${enrichBulkJob.skipped} low-confidence, ${enrichBulkJob.failed} failed`);
+        });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
+    }
+});
+
+// GET /api/scrape/enrich-ai/bulk/status
+router.get('/enrich-ai/bulk/status', requireSuperAdmin, (_req, res) => {
+    res.json({ success: true, ...enrichBulkJob });
+});
+
+// POST /api/scrape/enrich-ai/bulk/stop
+router.post('/enrich-ai/bulk/stop', requireSuperAdmin, (_req, res) => {
+    enrichBulkJob.running = false;
+    res.json({ success: true });
 });
 
 // POST /api/scrape/batch - Scrapear múltiples URLs

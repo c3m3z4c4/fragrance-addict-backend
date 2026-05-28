@@ -46,7 +46,9 @@ const PROVIDERS = {
 // In-memory cache for active provider (refreshed on each config change)
 let _activeProviderCache = null;
 
-async function getActiveProvider() {
+export { PROVIDERS };
+
+export async function getActiveProvider() {
     const dbRow = await dataStore.getActiveAIProvider();
     if (dbRow && dbRow.apiKey) {
         return { provider: dbRow.provider, apiKey: dbRow.apiKey, model: dbRow.activeModel };
