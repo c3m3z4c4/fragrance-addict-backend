@@ -6,6 +6,7 @@ import { browserPool } from '../services/browserPool.js';
 import { getPerfumeViaAlgolia, fetchAlgoliaPerfume } from '../services/algoliaService.js';
 import { enrichPerfumeWithAI, ENRICHABLE_FIELDS, DEFAULT_MIN_CONFIDENCE } from '../services/aiEnrichmentService.js';
 import { getActiveProvider } from './ai.js';
+import { getProxyConfig, fetchHtmlViaProxy } from '../services/scrapeProxyService.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
@@ -153,6 +154,51 @@ router.get('/perfume', requireSuperAdmin, scrapeLimiter, async (req, res, next) 
         res.json({ success: true, source: usedSource, data: perfume });
     } catch (error) {
         next(new ApiError(error.message, 500));
+    }
+});
+
+// GET /api/scrape/proxy/config — current scraping-API proxy config + available providers
+router.get('/proxy/config', requireSuperAdmin, (_req, res) => {
+    res.json({ success: true, ...getProxyConfig() });
+});
+
+// POST /api/scrape/proxy/config — set provider + key for this session.
+// Body: { provider, apiKey }. Persist by adding SCRAPER_API_PROVIDER/KEY to env for restarts.
+router.post('/proxy/config', requireSuperAdmin, (req, res, next) => {
+    const { provider, apiKey } = req.body || {};
+    const valid = ['scraperapi', 'scrapingbee', 'zenrows'];
+    if (!valid.includes((provider || '').toLowerCase())) {
+        return next(new ApiError(`provider must be one of: ${valid.join(', ')}`, 400));
+    }
+    if (!apiKey || typeof apiKey !== 'string' || !apiKey.trim()) {
+        return next(new ApiError('apiKey is required', 400));
+    }
+    process.env.SCRAPER_API_PROVIDER = provider.toLowerCase();
+    process.env.SCRAPER_API_KEY = apiKey.trim();
+    res.json({
+        success: true,
+        ...getProxyConfig(),
+        message: 'Proxy configured for this session. Add SCRAPER_API_PROVIDER + SCRAPER_API_KEY to env to persist across restarts.',
+    });
+});
+
+// POST /api/scrape/proxy/test — fetch a URL through the proxy and report basic signals
+router.post('/proxy/test', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const url = req.body?.url || 'https://www.fragrantica.com/perfume/Dior/Sauvage-31861.html';
+        const html = await fetchHtmlViaProxy(url, { render: true });
+        const title = (html.match(/<title>([^<]*)<\/title>/i)?.[1] || '').trim();
+        const blocked = /just a moment|attention required|security verification/i.test(title);
+        res.json({
+            success: !blocked,
+            bytes: html.length,
+            title,
+            blocked,
+            hasJsonLd: html.includes('application/ld+json'),
+            hasNotes: html.includes('/notes/'),
+        });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
     }
 });
 

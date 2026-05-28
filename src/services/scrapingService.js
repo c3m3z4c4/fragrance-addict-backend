@@ -2,6 +2,7 @@ import * as cheerio from 'cheerio';
 import { v4 as uuidv4 } from 'uuid';
 import { cacheService } from './cacheService.js';
 import { browserPool, waitForCloudflare } from './browserPool.js';
+import { isProxyConfigured, fetchHtmlViaProxy } from './scrapeProxyService.js';
 
 const SCRAPE_DELAY = parseInt(process.env.SCRAPE_DELAY_MS) || 500;
 
@@ -55,54 +56,52 @@ export const scrapePerfume = async (url) => {
         return cached;
     }
 
-    console.log(`🔍 Scraping con Puppeteer: ${url}`);
-
     try {
         await delay(SCRAPE_DELAY);
 
-        const html = await browserPool.withPage(async (page) => {
-            console.log('📄 Navegando a:', url);
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        let html;
+        if (isProxyConfigured()) {
+            // Preferred path: hosted scraping API fetches via residential IP and
+            // solves Cloudflare on their side. No Chromium on our VPS → no CPU
+            // spike, no malware flag, and we get the real (unblocked) HTML.
+            console.log(`🌍 Scraping via proxy API: ${url}`);
+            html = await fetchHtmlViaProxy(url, { render: true });
+        } else {
+            // Fallback: local Puppeteer (will hit Cloudflare's IP block on the VPS).
+            console.log(`🔍 Scraping con Puppeteer (no proxy configured): ${url}`);
+            html = await browserPool.withPage(async (page) => {
+                console.log('📄 Navegando a:', url);
+                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // Wait for Cloudflare JS challenge to auto-clear (stealth plugin handles fingerprint)
-            const cleared = await waitForCloudflare(page, 45000);
-            if (!cleared) {
-                const diag = await page.evaluate(() => ({
-                    title: document.title || '',
-                    h1: document.querySelector('h1')?.textContent?.trim().slice(0, 120) || '',
-                    bodyStart: document.body?.innerText?.trim().slice(0, 300) || '',
-                    hasTurnstile: !!document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]'),
-                    hasCfCookie: document.cookie.includes('__cf'),
-                    url: location.href,
-                })).catch(() => ({}));
-                console.warn(`🛡️  Cloudflare did not clear for ${url}`, diag);
-                throw new Error(`RATE_LIMITED: CF challenge stuck. DIAG=${JSON.stringify(diag)}`);
-            }
+                const cleared = await waitForCloudflare(page, 45000);
+                if (!cleared) {
+                    const diag = await page.evaluate(() => ({
+                        title: document.title || '',
+                        h1: document.querySelector('h1')?.textContent?.trim().slice(0, 120) || '',
+                        bodyStart: document.body?.innerText?.trim().slice(0, 300) || '',
+                        hasTurnstile: !!document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]'),
+                        hasCfCookie: document.cookie.includes('__cf'),
+                        url: location.href,
+                    })).catch(() => ({}));
+                    console.warn(`🛡️  Cloudflare did not clear for ${url}`, diag);
+                    throw new Error(`RATE_LIMITED: CF challenge stuck. DIAG=${JSON.stringify(diag)}`);
+                }
 
-            await page.waitForSelector('h1[itemprop="name"]', { timeout: 20000 }).catch(() => {});
+                await page.waitForSelector('h1[itemprop="name"]', { timeout: 20000 }).catch(() => {});
+                const ready = await page.evaluate(() => {
+                    const h1 = document.querySelector('h1[itemprop="name"]') || document.querySelector('h1');
+                    return !!(h1 && h1.textContent && h1.textContent.trim().length > 2);
+                });
+                if (!ready) throw new Error('INVALID_DATA: H1 not found after load');
 
-            const ready = await page.evaluate(() => {
-                const h1 = document.querySelector('h1[itemprop="name"]') || document.querySelector('h1');
-                return !!(h1 && h1.textContent && h1.textContent.trim().length > 2);
+                await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+                await new Promise(r => setTimeout(r, 400));
+                await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+                await page.waitForSelector('a[href*="/notes/"], [class*="accord-bar"]', { timeout: 5000 }).catch(() => {});
+                await new Promise(r => setTimeout(r, 300));
+                return page.content();
             });
-            if (!ready) {
-                const diag = await page.evaluate(() => ({
-                    title: document.title || '',
-                    bodyStart: document.body?.innerText?.trim().slice(0, 200) || '',
-                    url: location.href,
-                })).catch(() => ({}));
-                console.warn(`🚫 H1 missing for ${url}`, diag);
-                throw new Error(`INVALID_DATA: H1 not found. DIAG=${JSON.stringify(diag)}`);
-            }
-
-            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
-            await new Promise(r => setTimeout(r, 400));
-            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-            await page.waitForSelector('a[href*="/notes/"], [class*="accord-bar"]', { timeout: 5000 }).catch(() => {});
-            await new Promise(r => setTimeout(r, 300));
-
-            return page.content();
-        });
+        }
 
         const $ = cheerio.load(html);
 
