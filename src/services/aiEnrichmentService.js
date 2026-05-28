@@ -47,6 +47,27 @@ Respond with JSON only:
 
 // ─── Provider callers ─────────────────────────────────────────────────────────
 
+const GEMINI_SCHEMA = {
+    type: 'object',
+    properties: {
+        notes: {
+            type: 'object',
+            properties: {
+                top:   { type: 'array', items: { type: 'string' } },
+                heart: { type: 'array', items: { type: 'string' } },
+                base:  { type: 'array', items: { type: 'string' } },
+            },
+            required: ['top', 'heart', 'base'],
+        },
+        accords:       { type: 'array', items: { type: 'string' } },
+        perfumer:      { type: 'string' },
+        description:   { type: 'string' },
+        concentration: { type: 'string' },
+        confidence:    { type: 'number' },
+    },
+    required: ['notes', 'accords', 'confidence'],
+};
+
 async function callGemini(apiKey, model, prompt) {
     const base = 'https://generativelanguage.googleapis.com/v1beta/models';
     const resp = await fetch(`${base}/${model}:generateContent?key=${apiKey}`, {
@@ -56,8 +77,9 @@ async function callGemini(apiKey, model, prompt) {
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
                 temperature: 0.2,
-                maxOutputTokens: 1024,
+                maxOutputTokens: 2048,
                 responseMimeType: 'application/json',
+                responseSchema: GEMINI_SCHEMA,
             },
         }),
     });
@@ -102,13 +124,19 @@ async function callAnthropic(apiKey, model, prompt) {
 }
 
 function parseJson(rawText) {
-    try {
-        return JSON.parse(rawText);
-    } catch {
-        const match = rawText.match(/```(?:json)?\s*([\s\S]*?)```/) || rawText.match(/\{[\s\S]*\}/);
-        if (match) return JSON.parse(match[1] ?? match[0]);
-        throw new Error('AI returned non-JSON');
+    const attempts = [];
+    attempts.push(rawText);
+    const fence = rawText.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fence) attempts.push(fence[1]);
+    const braces = rawText.match(/\{[\s\S]*\}/);
+    if (braces) attempts.push(braces[0]);
+
+    for (const a of attempts) {
+        try { return JSON.parse(a); } catch { /* next */ }
+        // tolerate trailing commas
+        try { return JSON.parse(a.replace(/,(\s*[}\]])/g, '$1')); } catch { /* next */ }
     }
+    throw new Error(`AI returned non-JSON: ${rawText.slice(0, 120)}`);
 }
 
 async function runProvider({ provider, apiKey, model }, prompt) {
