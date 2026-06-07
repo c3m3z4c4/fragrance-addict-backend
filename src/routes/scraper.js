@@ -399,7 +399,7 @@ async function fetchBrandUrls(brand, limit = 500) {
         .replace(/['']/g, '')
         .replace(/&/g, 'and');
 
-    const brandUrl = `https://www.fragrantica.com/designers/${brandSlug}.html`;
+    const brandUrl = `https://www.fragrantica.es/disenador/${brandSlug}.html#all-fragrances`;
     console.log(`🔍 Fetching brand page: ${brandUrl}`);
 
     return browserPool.withPage(async (page) => {
@@ -657,9 +657,9 @@ router.post('/sitemap', requireSuperAdmin, async (req, res, next) => {
         try {
 
         if (brand) {
-            // Fragrantica brand URLs formats:
-            // - https://www.fragrantica.com/designers/Dior.html
-            // - https://www.fragrantica.com/designers/Tom-Ford.html
+            // Fragrantica brand URLs formats (.es domain, "disenador" path):
+            // - https://www.fragrantica.es/disenador/Dior.html#all-fragrances
+            // - https://www.fragrantica.es/disenador/Tom-Ford.html#all-fragrances
 
             // Normalize brand name for URL
             const brandSlug = brand
@@ -668,7 +668,7 @@ router.post('/sitemap', requireSuperAdmin, async (req, res, next) => {
                 .replace(/['']/g, '') // Remove apostrophes
                 .replace(/&/g, 'and'); // Replace & with 'and'
 
-            const brandUrl = `https://www.fragrantica.com/designers/${brandSlug}.html`;
+            const brandUrl = `https://www.fragrantica.es/disenador/${brandSlug}.html#all-fragrances`;
             console.log(`Fetching brand page: ${brandUrl}`);
 
             try {
@@ -1902,7 +1902,7 @@ async function tryLogoFromFragrantica(brandName) {
     return browserPool.withPage({ blockResources: false }, async (page) => {
         for (const slug of brandSlugs(brandName)) {
             try {
-                const url = `https://www.fragrantica.com/designers/${slug}.html`;
+                const url = `https://www.fragrantica.es/disenador/${slug}.html#all-fragrances`;
                 const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
                 if (!resp || resp.status() === 404) continue;
 
