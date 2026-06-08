@@ -1,6 +1,7 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
+import * as cheerio from 'cheerio';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { browserPool } from '../services/browserPool.js';
 import { getPerfumeViaAlgolia, fetchAlgoliaPerfume } from '../services/algoliaService.js';
@@ -401,6 +402,44 @@ async function fetchBrandUrls(brand, limit = 500) {
 
     const brandUrl = `https://www.fragrantica.es/disenador/${brandSlug}.html#all-fragrances`;
     console.log(`🔍 Fetching brand page: ${brandUrl}`);
+
+    // Prefer the hosted scraping proxy: Cloudflare blocks our VPS IP, so a direct
+    // Puppeteer visit returns a 403 challenge wall and zero perfume links. The
+    // proxy fetches through residential IPs and returns the real HTML, which we
+    // parse with cheerio. Falls back to local Puppeteer when no proxy is set.
+    if (getProxyConfig().configured) {
+        try {
+            const html = await fetchHtmlViaProxy(brandUrl, { render: true });
+            const $ = cheerio.load(html);
+
+            const urls = [...new Set(
+                $('a[href*="/perfume/"]')
+                    .map((_, a) => $(a).attr('href'))
+                    .get()
+                    .map(h => { try { return new URL(h, brandUrl).href; } catch { return null; } })
+                    .filter(h => h && !h.includes('#') && !h.includes('?') && /\/perfume\/[^/]+\/[^/]+\.html$/.test(h))
+            )].slice(0, limit);
+
+            let logoUrl = null;
+            const logoSelectors = [
+                'img[src*="/dizajneri/"]',
+                'img[src*="fimgs.net"][src*="/mdimg/"]',
+                '.brand-header img',
+                'header img',
+                '#main-content img',
+                'img[src*="fimgs.net"]',
+            ];
+            for (const sel of logoSelectors) {
+                const src = $(sel).first().attr('src');
+                if (src) { logoUrl = (() => { try { return new URL(src, brandUrl).href; } catch { return src; } })(); break; }
+            }
+
+            console.log(`  [proxy] Found ${urls.length} URLs for brand "${brand}", logo: ${logoUrl ? 'yes' : 'no'}`);
+            return { urls, brandUrl, logoUrl };
+        } catch (err) {
+            console.warn(`⚠️ Proxy brand fetch failed (${err.message}); falling back to Puppeteer`);
+        }
+    }
 
     return browserPool.withPage(async (page) => {
         // Logo discovery needs natural image dimensions — allow images for this short visit
