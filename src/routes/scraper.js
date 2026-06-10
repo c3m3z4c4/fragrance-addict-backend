@@ -7,7 +7,7 @@ import { browserPool } from '../services/browserPool.js';
 import { getPerfumeViaAlgolia, fetchAlgoliaPerfume } from '../services/algoliaService.js';
 import { enrichPerfumeWithAI, ENRICHABLE_FIELDS, DEFAULT_MIN_CONFIDENCE } from '../services/aiEnrichmentService.js';
 import { getActiveProvider } from './ai.js';
-import { getProxyConfig, fetchHtmlViaProxy } from '../services/scrapeProxyService.js';
+import { getProxyConfig, fetchHtmlViaProxy, PROVIDER_IDS } from '../services/scrapeProxyService.js';
 import { dataStore } from '../services/dataStore.js';
 import { cacheService } from '../services/cacheService.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
@@ -167,9 +167,8 @@ router.get('/proxy/config', requireSuperAdmin, (_req, res) => {
 // Body: { provider, apiKey }. Persist by adding SCRAPER_API_PROVIDER/KEY to env for restarts.
 router.post('/proxy/config', requireSuperAdmin, (req, res, next) => {
     const { provider, apiKey } = req.body || {};
-    const valid = ['scraperapi', 'scrapingbee', 'zenrows'];
-    if (!valid.includes((provider || '').toLowerCase())) {
-        return next(new ApiError(`provider must be one of: ${valid.join(', ')}`, 400));
+    if (!PROVIDER_IDS.includes((provider || '').toLowerCase())) {
+        return next(new ApiError(`provider must be one of: ${PROVIDER_IDS.join(', ')}`, 400));
     }
     if (!apiKey || typeof apiKey !== 'string' || !apiKey.trim()) {
         return next(new ApiError('apiKey is required', 400));
