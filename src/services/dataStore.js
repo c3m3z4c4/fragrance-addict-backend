@@ -69,7 +69,15 @@ const createPool = () => {
             ...poolConfig,
             connectionString: '***',
         });
-        return new Pool(poolConfig);
+        const newPool = new Pool(poolConfig);
+        // Idle clients can emit errors (e.g. DB restart / network drop). Without a
+        // listener pg crashes the whole process; instead flag for the watchdog to reconnect.
+        newPool.on('error', (err) => {
+            console.error('❌ Idle DB client error:', err.message);
+            isDatabaseConnected = false;
+            connectionError = `Idle client error: ${err.message}`;
+        });
+        return newPool;
     } catch (error) {
         console.error('❌ Error creating pool:', error.message);
         connectionError = error.message;
@@ -77,10 +85,17 @@ const createPool = () => {
     }
 };
 
-// Inicializar tabla si no existe
-export const initDatabase = async () => {
+// Un intento de conectar + crear tablas + seed. Devuelve { connected, error }.
+// Idempotente: seguro de llamar varias veces (lo usa el arranque con reintentos y el watchdog).
+const connectAndInit = async () => {
     console.log('🚀 Initializing database...');
     console.log('🌍 NODE_ENV:', process.env.NODE_ENV || 'development');
+
+    // Descartar un pool previo roto antes de recrear (evita fugas de sockets en reconexión)
+    if (pool) {
+        try { await pool.end(); } catch { /* noop */ }
+        pool = null;
+    }
 
     pool = createPool();
 
@@ -351,6 +366,60 @@ export const initDatabase = async () => {
         console.warn('⚠️ Continuing without database - using in-memory storage');
         return { connected: false, error: connectionError };
     }
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let reconnectWatchdog = null;
+
+// Arranca un chequeo periódico que reconecta si la DB se cae (reinicio de postgres,
+// corte de red, error de cliente idle). Idempotente: solo arranca un intervalo.
+const startReconnectWatchdog = (intervalMs = 15000) => {
+    if (reconnectWatchdog) return;
+    reconnectWatchdog = setInterval(async () => {
+        if (isDatabaseConnected) return;
+        console.warn('🔄 Database disconnected — watchdog attempting reconnect...');
+        const result = await connectAndInit();
+        if (result.connected) {
+            console.log('✅ Database reconnected by watchdog');
+        }
+    }, intervalMs);
+    // No bloquear la salida del proceso por este timer
+    if (typeof reconnectWatchdog.unref === 'function') reconnectWatchdog.unref();
+};
+
+// Punto de entrada público. Reintenta la conexión inicial con backoff (resuelve la carrera
+// de arranque donde el backend levanta antes de que el DNS de postgres resuelva en la red
+// Docker) y deja un watchdog activo para reconectar ante caídas posteriores.
+export const initDatabase = async ({ retries = 6, baseDelayMs = 1000, maxDelayMs = 4000 } = {}) => {
+    let lastResult = { connected: false, error: 'not attempted' };
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        lastResult = await connectAndInit();
+        if (lastResult.connected) break;
+
+        if (attempt < retries) {
+            const delay = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+            console.warn(
+                `⏳ DB connect attempt ${attempt}/${retries} failed (${lastResult.error}). ` +
+                `Retrying in ${Math.round(delay / 1000)}s...`
+            );
+            await sleep(delay);
+        }
+    }
+
+    if (!lastResult.connected) {
+        console.error(
+            `❌ Database unreachable after ${retries} attempts. ` +
+            `Watchdog will keep retrying in background.`
+        );
+    }
+
+    // Siempre dejar el watchdog activo: si la conexión inicial falló seguirá intentando,
+    // y si tuvo éxito reconectará ante una caída futura (p. ej. reinicio de postgres).
+    startReconnectWatchdog();
+
+    return lastResult;
 };
 
 // Seed the initial superadmin user from env vars
