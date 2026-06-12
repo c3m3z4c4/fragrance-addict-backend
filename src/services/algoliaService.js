@@ -213,6 +213,32 @@ export async function getPerfumeViaAlgolia(url) {
     return mapAlgoliaRecordToPerfume(record, url);
 }
 
+// Fetch canonical slugs for many objectIDs at once (batched OR-filter queries).
+// Returns Map<objectID(string), slug>. Skips ids Algolia no longer knows about.
+export async function fetchSlugsByObjectIds(objectIds, batchSize = 100) {
+    const out = new Map();
+    const ids = [...new Set(objectIds.map(String).filter(Boolean))];
+    for (let i = 0; i < ids.length; i += batchSize) {
+        const batch = ids.slice(i, i + batchSize);
+        const filters = batch.map((id) => `objectID:${id}`).join(' OR ');
+        const data = await algoliaPost(`/1/indexes/${INDEX}/query`, {
+            query: '',
+            filters,
+            hitsPerPage: batch.length,
+            attributesToRetrieve: ['slug', 'dizajner', 'naslov', 'objectID'],
+        });
+        for (const h of data?.hits || []) {
+            const id = String(h.objectID);
+            const slug = h.slug || (h.dizajner && h.naslov
+                ? `${slugifyFragrantica(h.dizajner)}/${slugifyFragrantica(h.naslov)}`
+                : null);
+            if (slug) out.set(id, slug.replace(/^\/+|\/+$/g, ''));
+        }
+        await sleep(120);
+    }
+    return out;
+}
+
 // ── Auto-refresh of the rotating Algolia search key ─────────────────────────────
 //
 // Fragrantica embeds the public search key inline in every page's

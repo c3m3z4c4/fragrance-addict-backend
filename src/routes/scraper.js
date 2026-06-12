@@ -3,7 +3,7 @@ import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { browserPool } from '../services/browserPool.js';
-import { getPerfumeViaAlgolia, fetchAlgoliaPerfume, fetchPerfumeUrlsByBrand } from '../services/algoliaService.js';
+import { getPerfumeViaAlgolia, fetchAlgoliaPerfume, fetchPerfumeUrlsByBrand, fetchSlugsByObjectIds, extractObjectIdFromUrl } from '../services/algoliaService.js';
 import { enrichPerfumeWithAI, ENRICHABLE_FIELDS, DEFAULT_MIN_CONFIDENCE } from '../services/aiEnrichmentService.js';
 import { getActiveProvider } from './ai.js';
 import { getProxyConfig, fetchHtmlViaProxy, PROVIDER_IDS } from '../services/scrapeProxyService.js';
@@ -413,6 +413,51 @@ async function fetchBrandUrls(brand, limit = 500) {
     console.log(`  [algolia] Found ${urls.length} URLs for brand "${brand}" (facet: ${facet || 'n/a'})`);
     return { urls, brandUrl, logoUrl };
 }
+
+// POST /api/scrape/migrate-source-urls — rewrite legacy .com/lowercase perfume
+// URLs to the canonical fragrantica.es form (correct casing from Algolia's slug).
+// Idempotent: rows already on .es are skipped without hitting Algolia, so it is
+// safe to re-run if it times out. Duplicates (a row whose canonical URL already
+// belongs to another row) are deleted.
+const ES_PERFUME_PREFIX = 'https://www.fragrantica.es/perfume/';
+router.post('/migrate-source-urls', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const all = await dataStore.getAllIdSourceUrls();
+        const work = [];
+        let alreadyEs = 0;
+        for (const { id, sourceUrl } of all) {
+            if (sourceUrl.startsWith(ES_PERFUME_PREFIX)) { alreadyEs++; continue; }
+            const oid = extractObjectIdFromUrl(sourceUrl);
+            if (oid) work.push({ id, sourceUrl, oid });
+        }
+
+        const slugMap = await fetchSlugsByObjectIds(work.map((w) => w.oid));
+
+        let updated = 0, deletedDuplicates = 0, skipped = 0, unmapped = 0;
+        for (const w of work) {
+            const slug = slugMap.get(String(w.oid));
+            if (!slug) { unmapped++; continue; }
+            const newUrl = `${ES_PERFUME_PREFIX}${slug}-${w.oid}.html`;
+            if (newUrl === w.sourceUrl) { skipped++; continue; }
+            const result = await dataStore.migrateSourceUrl(w.id, newUrl);
+            if (result === 'updated') updated++;
+            else if (result === 'conflict') { await dataStore.delete(w.id); deletedDuplicates++; }
+        }
+
+        res.json({
+            success: true,
+            scanned: all.length,
+            alreadyCanonical: alreadyEs,
+            candidates: work.length,
+            updated,
+            deletedDuplicates,
+            skipped,
+            unmapped,
+        });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
+    }
+});
 
 // POST /api/scrape/brand - Scraping automático de una marca completa
 router.post('/brand', requireSuperAdmin, async (req, res, next) => {

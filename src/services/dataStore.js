@@ -675,6 +675,29 @@ export const dataStore = {
         return result.rows.map((row) => row.source_url);
     },
 
+    // id + source_url for every perfume — used by the URL migration.
+    getAllIdSourceUrls: async () => {
+        if (!isDatabaseConnected) return [];
+        const result = await pool.query(
+            'SELECT id, source_url FROM perfumes WHERE source_url IS NOT NULL'
+        );
+        return result.rows.map((r) => ({ id: r.id, sourceUrl: r.source_url }));
+    },
+
+    // Repoint one perfume to a new canonical source_url. If another row already
+    // owns that URL (a duplicate), returns 'conflict' instead of violating the
+    // unique constraint, so the caller can delete this row.
+    migrateSourceUrl: async (id, newUrl) => {
+        if (!isDatabaseConnected) return 'noop';
+        const result = await pool.query(
+            `UPDATE perfumes SET source_url = $2, updated_at = NOW()
+             WHERE id = $1
+               AND NOT EXISTS (SELECT 1 FROM perfumes p2 WHERE p2.source_url = $2 AND p2.id <> $1)`,
+            [id, newUrl]
+        );
+        return result.rowCount > 0 ? 'updated' : 'conflict';
+    },
+
     // ── Scrape Queue (persistent) ──────────────────────────────────────────────
 
     // Add URLs to the queue (skip already queued/done)
