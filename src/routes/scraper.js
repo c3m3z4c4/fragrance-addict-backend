@@ -1042,9 +1042,15 @@ async function scrapeWorker(workerId) {
                     console.log(`[worker-${workerId}] 📚 Algolia: ${perfume.name}`);
                 }
             } catch (err) {
+                const m = String(err.message);
+                // Rate limiting is transient — rethrow so the URL is deferred and
+                // retried with backoff, NOT permanently failed as "not found".
+                if (m.includes('RATE_LIMITED') || m.includes('429') || /too many requests/i.test(m)) {
+                    throw new Error(`RATE_LIMITED: Algolia ${m}`);
+                }
                 // ALGOLIA_KEY_MISSING is expected when no key configured — silent.
-                if (!String(err.message).includes('ALGOLIA_KEY_MISSING')) {
-                    console.warn(`[worker-${workerId}] Algolia failed (${err.message}) — falling back`);
+                if (!m.includes('ALGOLIA_KEY_MISSING')) {
+                    console.warn(`[worker-${workerId}] Algolia failed (${m}) — falling back`);
                 }
             }
 

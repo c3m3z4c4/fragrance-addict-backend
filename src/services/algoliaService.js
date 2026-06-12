@@ -18,30 +18,49 @@ const INDEX = 'fragrantica_perfumes';
 
 const getApiKey = () => process.env.ALGOLIA_API_KEY || '';
 
-async function algoliaPost(path, body, timeoutMs = 12000) {
+async function algoliaPost(path, body, timeoutMs = 12000, retries = 4) {
     const key = getApiKey();
     if (!key) throw new Error('ALGOLIA_KEY_MISSING: configure ALGOLIA_API_KEY env or paste a key in the admin UI');
 
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), timeoutMs);
-    try {
-        const res = await fetch(`${ALGOLIA_BASE}${path}`, {
-            method: 'POST',
-            signal: ac.signal,
-            headers: {
-                'X-Algolia-Application-Id': ALGOLIA_APP_ID,
-                'X-Algolia-API-Key': key,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(body),
-        });
-        if (!res.ok) {
-            const err = await res.json().catch(() => ({}));
-            throw new Error(err.message || `Algolia HTTP ${res.status}`);
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), timeoutMs);
+        try {
+            const res = await fetch(`${ALGOLIA_BASE}${path}`, {
+                method: 'POST',
+                signal: ac.signal,
+                headers: {
+                    'X-Algolia-Application-Id': ALGOLIA_APP_ID,
+                    'X-Algolia-API-Key': key,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body),
+            });
+            // Algolia throttles per IP/key. Back off and retry on 429 instead of
+            // failing the whole import; surface a RATE_LIMITED error if it persists.
+            if (res.status === 429) {
+                if (attempt < retries) {
+                    await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** attempt, 8000)));
+                    continue;
+                }
+                throw new Error('RATE_LIMITED: Algolia 429 (Too many requests)');
+            }
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.message || `Algolia HTTP ${res.status}`);
+            }
+            return res.json();
+        } catch (err) {
+            // Retry transient aborts/network errors too; rethrow on the last attempt.
+            const transient = err.name === 'AbortError' || /network|fetch failed|ECONN/i.test(err.message);
+            if (transient && attempt < retries) {
+                await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** attempt, 8000)));
+                continue;
+            }
+            throw err;
+        } finally {
+            clearTimeout(timer);
         }
-        return res.json();
-    } finally {
-        clearTimeout(timer);
     }
 }
 
