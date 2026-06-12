@@ -215,7 +215,9 @@ export async function getPerfumeViaAlgolia(url) {
 
 // Fetch canonical slugs for many objectIDs at once (batched OR-filter queries).
 // Returns Map<objectID(string), slug>. Skips ids Algolia no longer knows about.
-export async function fetchSlugsByObjectIds(objectIds, batchSize = 100) {
+// batchSize kept small: Algolia silently caps results on large OR-filters
+// (100 ids → ~50 hits; 20 ids → all). 20 resolves 100%.
+export async function fetchSlugsByObjectIds(objectIds, batchSize = 20) {
     const out = new Map();
     const ids = [...new Set(objectIds.map(String).filter(Boolean))];
     for (let i = 0; i < ids.length; i += batchSize) {
