@@ -14,6 +14,7 @@ import express from 'express';
 import { dataStore } from '../services/dataStore.js';
 import { requireSuperAdmin } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
+import { fetchFreshAlgoliaKey } from '../services/algoliaService.js';
 
 const router = express.Router();
 
@@ -197,6 +198,40 @@ router.post('/key', requireSuperAdmin, async (req, res) => {
             ? 'API key saved and persisted — it will survive restarts.'
             : 'API key saved for this session (DB unavailable, will not persist across restarts).',
     });
+});
+
+// Shared: fetch a fresh key from Fragrantica's public HTML, persist it, apply it.
+// Used by the manual refresh endpoint and the auto-refresh scheduler.
+export async function refreshAlgoliaKey() {
+    const { key, expiresTs, source } = await fetchFreshAlgoliaKey();
+    process.env.ALGOLIA_API_KEY = key;
+    process.env.ALGOLIA_KEY_EXPIRES = String(expiresTs);
+    let persisted = false;
+    try {
+        await dataStore.setSetting('ALGOLIA_API_KEY', key);
+        persisted = true;
+    } catch (err) {
+        console.warn('[algolia] Could not persist refreshed key:', err.message);
+    }
+    console.log(`🔑 Algolia key refreshed from ${source} (expires ${new Date(expiresTs * 1000).toISOString()})`);
+    return { key, expiresTs, source, persisted };
+}
+
+// POST /api/algolia/key/refresh — auto-fetch a fresh key from Fragrantica's public HTML
+router.post('/key/refresh', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const r = await refreshAlgoliaKey();
+        res.json({
+            success: true,
+            valid: true,
+            expiresAt: new Date(r.expiresTs * 1000).toISOString(),
+            source: r.source,
+            persisted: r.persisted,
+            message: 'Fetched and applied a fresh Algolia key automatically.',
+        });
+    } catch (err) {
+        next(new ApiError(err.message, 502));
+    }
 });
 
 // GET /api/algolia/brands — fetch all brands from Algolia

@@ -18,7 +18,8 @@ import aiRoutes from './routes/ai.js';
 import activityRoutes from './routes/activity.js';
 import backupRoutes from './routes/backup.js';
 import perfumersRoutes from './routes/perfumers.js';
-import algoliaRoutes from './routes/algolia.js';
+import algoliaRoutes, { refreshAlgoliaKey } from './routes/algolia.js';
+import { algoliaKeyExpiry } from './services/algoliaService.js';
 import docsRoutes from './routes/docs.js';
 import { initScheduler } from './services/backupScheduler.js';
 import { errorHandler } from './middleware/errorHandler.js';
@@ -173,6 +174,27 @@ const startServer = async () => {
   } catch (err) {
     console.warn('⚠️ Could not load persisted settings:', err.message);
   }
+
+  // Auto-refresh the rotating Algolia key. It expires ~every 3 weeks; rather than
+  // requiring a manual DevTools capture, we read a fresh one from Fragrantica's
+  // public HTML. Runs at boot (if missing/near expiry) and daily thereafter. If
+  // Cloudflare blocks the server IP on every mirror this just logs and leaves the
+  // current key in place — refresh can then be triggered from a non-blocked IP.
+  const REFRESH_IF_EXPIRES_WITHIN = 3 * 24 * 60 * 60; // 3 days
+  const ensureFreshAlgoliaKey = async () => {
+    const key = process.env.ALGOLIA_API_KEY || '';
+    const exp = key ? algoliaKeyExpiry(key) : null;
+    const soon = !key || !exp || exp - Math.floor(Date.now() / 1000) < REFRESH_IF_EXPIRES_WITHIN;
+    if (!soon) return;
+    try {
+      await refreshAlgoliaKey();
+    } catch (err) {
+      console.warn('⚠️ Algolia key auto-refresh failed:', err.message);
+    }
+  };
+  await ensureFreshAlgoliaKey();
+  const algoliaKeyTimer = setInterval(ensureFreshAlgoliaKey, 24 * 60 * 60 * 1000);
+  if (typeof algoliaKeyTimer.unref === 'function') algoliaKeyTimer.unref();
 
   // Initialize backup scheduler (reads config from DB, harmless if DB unavailable)
   await initScheduler();

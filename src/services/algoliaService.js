@@ -194,6 +194,103 @@ export async function getPerfumeViaAlgolia(url) {
     return mapAlgoliaRecordToPerfume(record, url);
 }
 
+// ── Auto-refresh of the rotating Algolia search key ─────────────────────────────
+//
+// Fragrantica embeds the public search key inline in every page's
+// `window.fragranticaRuntime` (as a base64 string decoding to "<hash>validUntil=<ts>").
+// We can read it with a plain GET — no login. The only catch is Cloudflare blocks
+// our datacenter IP, so we try several Fragrantica mirror domains; if any one
+// returns the HTML we extract a fresh key from it.
+
+const KEY_SOURCE_DOMAINS = [
+    'https://www.fragrantica.com/',
+    'https://www.fragrantica.es/',
+    'https://www.fragrantica.com.br/',
+    'https://www.fragrantica.ru/',
+    'https://www.fragrantica.nl/',
+];
+
+const BROWSER_UA =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// Decode the validUntil timestamp (unix seconds) embedded in an Algolia search key.
+export function algoliaKeyExpiry(key) {
+    try {
+        const decoded = Buffer.from(key + '===', 'base64').toString('utf-8');
+        const m = decoded.match(/validUntil=(\d+)/);
+        return m ? parseInt(m[1], 10) : null;
+    } catch {
+        return null;
+    }
+}
+
+// Pull the freshest Algolia key out of a page's HTML. Returns { key, expiresTs } or null.
+export function extractAlgoliaKeyFromHtml(html) {
+    if (!html) return null;
+    const candidates = new Set(html.match(/[A-Za-z0-9+/]{80,}={0,2}/g) || []);
+    let best = null;
+    for (const c of candidates) {
+        const ts = algoliaKeyExpiry(c);
+        if (ts && (!best || ts > best.expiresTs)) best = { key: c, expiresTs: ts };
+    }
+    return best;
+}
+
+/**
+ * Fetch a fresh, valid Algolia search key from Fragrantica's public HTML.
+ * Tries each mirror domain until one is reachable (not Cloudflare-blocked) and
+ * yields a key that is (a) not yet expired and (b) actually accepted by Algolia.
+ * @returns {Promise<{ key: string, expiresTs: number, source: string }>}
+ * @throws if every mirror is blocked or yields no usable key.
+ */
+export async function fetchFreshAlgoliaKey({ timeoutMs = 15000 } = {}) {
+    const errors = [];
+    for (const url of KEY_SOURCE_DOMAINS) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), timeoutMs);
+        try {
+            const res = await fetch(url, {
+                signal: ac.signal,
+                headers: {
+                    'User-Agent': BROWSER_UA,
+                    'Accept': 'text/html,application/xhtml+xml',
+                    'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
+                },
+            });
+            const html = await res.text();
+            if (!res.ok) { errors.push(`${url} → HTTP ${res.status}`); continue; }
+            if (/just a moment|attention required|cf-browser-verification/i.test(html)) {
+                errors.push(`${url} → Cloudflare wall`);
+                continue;
+            }
+            const found = extractAlgoliaKeyFromHtml(html);
+            if (!found) { errors.push(`${url} → no key in HTML`); continue; }
+            if (found.expiresTs <= Math.floor(Date.now() / 1000)) {
+                errors.push(`${url} → key already expired`);
+                continue;
+            }
+            // Validate the key really works before trusting it.
+            const prev = process.env.ALGOLIA_API_KEY;
+            try {
+                process.env.ALGOLIA_API_KEY = found.key;
+                await algoliaPost(`/1/indexes/${INDEX}/query`, { query: 'dior', hitsPerPage: 1 });
+            } catch (e) {
+                process.env.ALGOLIA_API_KEY = prev;
+                errors.push(`${url} → key rejected by Algolia (${e.message})`);
+                continue;
+            } finally {
+                if (prev !== undefined) process.env.ALGOLIA_API_KEY = prev;
+            }
+            return { key: found.key, expiresTs: found.expiresTs, source: url };
+        } catch (err) {
+            errors.push(`${url} → ${err.name === 'AbortError' ? 'timeout' : err.message}`);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+    throw new Error(`Could not fetch a fresh Algolia key. Tried: ${errors.join('; ')}`);
+}
+
 // ── Free discovery by brand / designer / name (Algolia only, no Cloudflare) ──────
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
