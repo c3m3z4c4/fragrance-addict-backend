@@ -1,0 +1,63 @@
+name: Refresh Algolia key
+
+# Fragrantica's Algolia search key rotates ~every 3 weeks and is embedded in the
+# public homepage HTML. Cloudflare blocks the production server's datacenter IP,
+# so the server cannot self-refresh. This workflow runs the fetch+extract from
+# GitHub's runners (a different IP) and pushes the fresh key to the backend.
+#
+# Required repo secrets:
+#   BACKEND_URL      e.g. https://api.parfumeria.c3m3z4.dev   (no trailing slash)
+#   BACKEND_API_KEY  an API key accepted by the backend's x-api-key auth
+#
+# Run it manually first (Actions tab -> Run workflow) to confirm GitHub's IP is
+# not also Cloudflare-blocked. If it is, run the same steps from any non-blocked
+# machine instead (needs curl + python3 + extract_algolia_key.py + the secrets).
+
+on:
+  schedule:
+    - cron: '0 6 */3 * *'   # every 3 days at 06:00 UTC
+  workflow_dispatch:        # allow manual runs
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo (for the extractor script)
+        uses: actions/checkout@v4
+
+      - name: Fetch, extract and push the Algolia key
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          BACKEND_API_KEY: ${{ secrets.BACKEND_API_KEY }}
+        run: |
+          set -euo pipefail
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+          DOMAINS="https://www.fragrantica.com/ https://www.fragrantica.es/ https://www.fragrantica.com.br/ https://www.fragrantica.ru/"
+
+          KEY=""
+          for url in $DOMAINS; do
+            echo "Trying $url"
+            html=$(curl -s --max-time 25 -A "$UA" -H 'Accept-Language: en-US,en;q=0.9' "$url" || true)
+            if echo "$html" | grep -qiE 'just a moment|attention required'; then
+              echo "  Cloudflare wall"; continue
+            fi
+            KEY=$(printf '%s' "$html" | python3 .github/scripts/extract_algolia_key.py)
+            if [ -n "$KEY" ]; then echo "  Found key (len ${#KEY})"; break; fi
+            echo "  No key in HTML"
+          done
+
+          if [ -z "$KEY" ]; then
+            echo "::error::Could not extract a fresh Algolia key from any mirror (Cloudflare may be blocking GitHub's IP too)."
+            exit 1
+          fi
+
+          echo "Pushing key to backend..."
+          BODY=$(KEY="$KEY" python3 -c 'import json,os;print(json.dumps({"apiKey":os.environ["KEY"]}))')
+          code=$(curl -s -o /tmp/resp.json -w '%{http_code}' --max-time 30 \
+            -X POST "$BACKEND_URL/api/algolia/key/external" \
+            -H "x-api-key: $BACKEND_API_KEY" \
+            -H 'Content-Type: application/json' \
+            -d "$BODY")
+          cat /tmp/resp.json; echo
+          [ "$code" = "200" ] || { echo "::error::Backend returned HTTP $code"; exit 1; }
+          echo "Algolia key refreshed."

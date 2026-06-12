@@ -12,9 +12,9 @@
 
 import express from 'express';
 import { dataStore } from '../services/dataStore.js';
-import { requireSuperAdmin } from '../middleware/auth.js';
+import { requireSuperAdmin, requireApiKey } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
-import { fetchFreshAlgoliaKey } from '../services/algoliaService.js';
+import { fetchFreshAlgoliaKey, algoliaKeyExpiry } from '../services/algoliaService.js';
 
 const router = express.Router();
 
@@ -216,6 +216,29 @@ export async function refreshAlgoliaKey() {
     console.log(`🔑 Algolia key refreshed from ${source} (expires ${new Date(expiresTs * 1000).toISOString()})`);
     return { key, expiresTs, source, persisted };
 }
+
+// POST /api/algolia/key/external — ingest a key fetched by an off-server cron
+// (e.g. GitHub Actions), authed by x-api-key instead of a JWT. Use this when
+// Cloudflare blocks the server IP so it cannot self-refresh: the cron runs the
+// fetch+extract from a non-blocked IP and pushes the key here.
+router.post('/key/external', requireApiKey, async (req, res, next) => {
+    try {
+        const key = (req.body?.apiKey || '').trim();
+        if (!key) return next(new ApiError('apiKey is required', 400));
+        const exp = algoliaKeyExpiry(key);
+        if (exp && exp <= Math.floor(Date.now() / 1000)) {
+            return next(new ApiError('Provided key is already expired', 400));
+        }
+        process.env.ALGOLIA_API_KEY = key;
+        if (exp) process.env.ALGOLIA_KEY_EXPIRES = String(exp);
+        let persisted = false;
+        try { await dataStore.setSetting('ALGOLIA_API_KEY', key); persisted = true; } catch { /* noop */ }
+        console.log(`🔑 Algolia key ingested via API (expires ${exp ? new Date(exp * 1000).toISOString() : 'unknown'})`);
+        res.json({ success: true, persisted, expiresAt: exp ? new Date(exp * 1000).toISOString() : null });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
+    }
+});
 
 // POST /api/algolia/key/refresh — auto-fetch a fresh key from Fragrantica's public HTML
 router.post('/key/refresh', requireSuperAdmin, async (req, res, next) => {
