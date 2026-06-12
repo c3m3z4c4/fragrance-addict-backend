@@ -1,10 +1,9 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
-import * as cheerio from 'cheerio';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { browserPool } from '../services/browserPool.js';
-import { getPerfumeViaAlgolia, fetchAlgoliaPerfume } from '../services/algoliaService.js';
+import { getPerfumeViaAlgolia, fetchAlgoliaPerfume, fetchPerfumeUrlsByBrand } from '../services/algoliaService.js';
 import { enrichPerfumeWithAI, ENRICHABLE_FIELDS, DEFAULT_MIN_CONFIDENCE } from '../services/aiEnrichmentService.js';
 import { getActiveProvider } from './ai.js';
 import { getProxyConfig, fetchHtmlViaProxy, PROVIDER_IDS } from '../services/scrapeProxyService.js';
@@ -394,83 +393,25 @@ router.post('/batch', requireSuperAdmin, async (req, res, next) => {
 // ─── Shared helper: fetch all perfume URLs from a Fragrantica brand page ───────
 
 async function fetchBrandUrls(brand, limit = 500) {
-    const brandSlug = brand.trim()
+    // Free discovery via Algolia faceting — Fragrantica's own search backend.
+    // Bypasses Cloudflare entirely (we never touch fragrantica.com HTML), so no
+    // proxy, no residential IPs, no Puppeteer, no cost. Each URL's full data is
+    // resolved later by the queue worker (Algolia again) and AI enrichment.
+    const { facet, urls } = await fetchPerfumeUrlsByBrand(brand.trim(), limit);
+
+    // Canonical designer page (cosmetic — stored with the brand record). Algolia
+    // does not expose a brand logo, so logoUrl stays null and is filled elsewhere.
+    const brandSlug = (facet || brand.trim())
+        .normalize('NFD').replace(/[̀-ͯ]/g, '')
+        .replace(/['’`]/g, '')
+        .replace(/&/g, 'and')
         .replace(/\s+/g, '-')
-        .replace(/['']/g, '')
-        .replace(/&/g, 'and');
+        .replace(/[^A-Za-z0-9-]+/g, '');
+    const brandUrl = `https://www.fragrantica.com/designers/${brandSlug}.html`;
+    const logoUrl = null;
 
-    const brandUrl = `https://www.fragrantica.es/disenador/${brandSlug}.html#all-fragrances`;
-    console.log(`🔍 Fetching brand page: ${brandUrl}`);
-
-    // Prefer the hosted scraping proxy: Cloudflare blocks our VPS IP, so a direct
-    // Puppeteer visit returns a 403 challenge wall and zero perfume links. The
-    // proxy fetches through residential IPs and returns the real HTML, which we
-    // parse with cheerio. Falls back to local Puppeteer when no proxy is set.
-    if (getProxyConfig().configured) {
-        try {
-            const html = await fetchHtmlViaProxy(brandUrl, { render: true });
-            const $ = cheerio.load(html);
-
-            const urls = [...new Set(
-                $('a[href*="/perfume/"]')
-                    .map((_, a) => $(a).attr('href'))
-                    .get()
-                    .map(h => { try { return new URL(h, brandUrl).href; } catch { return null; } })
-                    .filter(h => h && !h.includes('#') && !h.includes('?') && /\/perfume\/[^/]+\/[^/]+\.html$/.test(h))
-            )].slice(0, limit);
-
-            let logoUrl = null;
-            const logoSelectors = [
-                'img[src*="/dizajneri/"]',
-                'img[src*="fimgs.net"][src*="/mdimg/"]',
-                '.brand-header img',
-                'header img',
-                '#main-content img',
-                'img[src*="fimgs.net"]',
-            ];
-            for (const sel of logoSelectors) {
-                const src = $(sel).first().attr('src');
-                if (src) { logoUrl = (() => { try { return new URL(src, brandUrl).href; } catch { return src; } })(); break; }
-            }
-
-            console.log(`  [proxy] Found ${urls.length} URLs for brand "${brand}", logo: ${logoUrl ? 'yes' : 'no'}`);
-            return { urls, brandUrl, logoUrl };
-        } catch (err) {
-            console.warn(`⚠️ Proxy brand fetch failed (${err.message}); falling back to Puppeteer`);
-        }
-    }
-
-    return browserPool.withPage(async (page) => {
-        // Logo discovery needs natural image dimensions — allow images for this short visit
-        // by overriding interception. Skip: keep blocked, logo is detected by URL pattern not size.
-        await page.goto(brandUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForSelector('a[href*="/perfume/"]', { timeout: 15000 }).catch(() => {});
-
-        const logoUrl = await page.evaluate(() => {
-            const selectors = [
-                'img[src*="/dizajneri/"]',
-                'img[src*="fimgs.net"][src*="/mdimg/"]',
-                '.brand-header img',
-                'header img',
-                '#main-content img',
-            ];
-            for (const sel of selectors) {
-                const img = document.querySelector(sel);
-                if (img?.src) return img.src;
-            }
-            const anyFimgs = document.querySelector('img[src*="fimgs.net"]');
-            return anyFimgs?.src || null;
-        }).catch(() => null);
-
-        let urls = await page.evaluate(() =>
-            Array.from(document.querySelectorAll('a[href*="/perfume/"]'))
-                .map(a => a.href)
-                .filter(h => h.includes('/perfume/') && !h.includes('#') && !h.includes('?') && /\/perfume\/[^/]+\/[^/]+\.html$/.test(h))
-        );
-        urls = [...new Set(urls)].slice(0, limit);
-        console.log(`  Found ${urls.length} URLs for brand "${brand}", logo: ${logoUrl ? 'yes' : 'no'}`);
-        return { urls, brandUrl, logoUrl };
-    });
+    console.log(`  [algolia] Found ${urls.length} URLs for brand "${brand}" (facet: ${facet || 'n/a'})`);
+    return { urls, brandUrl, logoUrl };
 }
 
 // POST /api/scrape/brand - Scraping automático de una marca completa
@@ -1108,8 +1049,16 @@ async function scrapeWorker(workerId) {
             }
 
             if (!perfume) {
-                perfume = await scrapePerfume(url);
-                dataSource = 'scrape';
+                // Free mode: if Algolia has no record and no scraping proxy is
+                // configured, skip rather than launch Puppeteer — Cloudflare blocks
+                // our VPS IP (zero data) and Chromium spikes CPU. Only fall back to
+                // HTML scraping when a proxy is actually configured.
+                if (getProxyConfig().configured) {
+                    perfume = await scrapePerfume(url);
+                    dataSource = 'scrape';
+                } else {
+                    throw new Error('INVALID_DATA: not found in Algolia (no scraping proxy configured)');
+                }
             }
             void dataSource;
 

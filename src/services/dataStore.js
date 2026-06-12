@@ -347,6 +347,16 @@ const connectAndInit = async () => {
       ('openai',        NULL, 'gpt-4o-mini',       FALSE),
       ('anthropic',     NULL, 'claude-haiku-4-5-20251001', FALSE)
     ON CONFLICT (provider) DO NOTHING;
+
+    -- ===== GENERIC KEY/VALUE SETTINGS =====
+    -- Persists runtime config set from the admin UI (e.g. the rotating Algolia
+    -- search key) so it survives container restarts instead of living only in
+    -- process.env for one session.
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key VARCHAR(100) PRIMARY KEY,
+      value TEXT,
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
   `;
 
     try {
@@ -2091,6 +2101,28 @@ export const dataStore = {
             console.error('❌ getActiveAIProvider:', err.message);
             return null;
         }
+    },
+
+    // ── Generic key/value settings (persist runtime config across restarts) ──
+    getSetting: async (key) => {
+        if (!isDatabaseConnected) return null;
+        try {
+            const result = await pool.query(
+                'SELECT value FROM app_settings WHERE key = $1',
+                [key]
+            );
+            return result.rows[0]?.value ?? null;
+        } catch { return null; }
+    },
+
+    setSetting: async (key, value) => {
+        if (!isDatabaseConnected) return;
+        await pool.query(
+            `INSERT INTO app_settings (key, value, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+            [key, value ?? null]
+        );
     },
 
     getAIProviderKey: async (provider) => {

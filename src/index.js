@@ -161,6 +161,19 @@ const startServer = async () => {
     console.log('🔄 Server will start anyway with in-memory storage');
   }
 
+  // Load runtime config persisted from the admin UI (survives restarts).
+  // The Algolia search key rotates ~every 3 weeks; a DB-persisted value (pasted
+  // in the admin UI) takes precedence over the env seed so refreshes stick.
+  try {
+    const persistedAlgoliaKey = await dataStore.getSetting('ALGOLIA_API_KEY');
+    if (persistedAlgoliaKey) {
+      process.env.ALGOLIA_API_KEY = persistedAlgoliaKey;
+      console.log('🔑 Loaded persisted ALGOLIA_API_KEY from DB');
+    }
+  } catch (err) {
+    console.warn('⚠️ Could not load persisted settings:', err.message);
+  }
+
   // Initialize backup scheduler (reads config from DB, harmless if DB unavailable)
   await initScheduler();
 

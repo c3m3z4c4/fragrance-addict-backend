@@ -168,8 +168,8 @@ router.get('/status', requireSuperAdmin, (req, res) => {
     });
 });
 
-// POST /api/algolia/key — save new Algolia API key
-router.post('/key', requireSuperAdmin, (req, res) => {
+// POST /api/algolia/key — save new Algolia API key (persisted across restarts)
+router.post('/key', requireSuperAdmin, async (req, res) => {
     const { apiKey } = req.body;
     if (!apiKey || typeof apiKey !== 'string' || !apiKey.trim()) {
         return res.json({ success: false, error: 'apiKey is required' });
@@ -178,11 +178,24 @@ router.post('/key', requireSuperAdmin, (req, res) => {
     const ts = parseKeyExpiry(key);
     process.env.ALGOLIA_API_KEY = key;
     if (ts) process.env.ALGOLIA_KEY_EXPIRES = String(ts);
+
+    // Persist to DB so the rotating key survives container restarts.
+    let persisted = false;
+    try {
+        await dataStore.setSetting('ALGOLIA_API_KEY', key);
+        persisted = true;
+    } catch (err) {
+        console.warn('[algolia] Could not persist key to DB:', err.message);
+    }
+
     res.json({
         success: true,
         valid: isKeyValid(key),
         expiresAt: ts ? new Date(ts * 1000).toISOString() : null,
-        message: 'API key saved for this session. Restart the server with ALGOLIA_API_KEY in .env to persist it.',
+        persisted,
+        message: persisted
+            ? 'API key saved and persisted — it will survive restarts.'
+            : 'API key saved for this session (DB unavailable, will not persist across restarts).',
     });
 });
 

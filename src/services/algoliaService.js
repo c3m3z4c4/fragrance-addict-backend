@@ -193,3 +193,90 @@ export async function getPerfumeViaAlgolia(url) {
     if (!record) return null;
     return mapAlgoliaRecordToPerfume(record, url);
 }
+
+// ── Free discovery by brand / designer / name (Algolia only, no Cloudflare) ──────
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Slugify a brand/name the way Fragrantica builds its URL slugs.
+function slugifyFragrantica(str) {
+    return String(str || '')
+        .normalize('NFD').replace(/[̀-ͯ]/g, '')
+        .replace(/['’`]/g, '')
+        .replace(/&/g, 'and')
+        .replace(/\s+/g, '-')
+        .replace(/[^A-Za-z0-9-]+/g, '')
+        .replace(/^-+|-+$/g, '');
+}
+
+// Canonical Fragrantica perfume URL from an Algolia record. Prefers the record's
+// own `slug` ("Dior/Sauvage"); falls back to slugifying brand + name.
+export function buildPerfumeUrlFromRecord(record) {
+    const id = record?.objectID || record?.id;
+    if (!id) return null;
+    const slug = record.slug
+        ? record.slug.replace(/^\/+|\/+$/g, '')
+        : `${slugifyFragrantica(record.dizajner)}/${slugifyFragrantica(record.naslov)}`;
+    return `https://www.fragrantica.com/perfume/${slug}-${id}.html`;
+}
+
+// Resolve a loosely-typed brand name to the EXACT facet value in the index
+// (facet values are case-sensitive, e.g. "Tom Ford"). Returns null if no match.
+export async function resolveBrandFacetValue(brand) {
+    const q = String(brand || '').trim();
+    if (!q) return null;
+    const data = await algoliaPost(`/1/indexes/${INDEX}/facets/dizajner/query`, {
+        facetQuery: q,
+        maxFacetHits: 20,
+    });
+    const hits = data?.facetHits || [];
+    if (!hits.length) return null;
+    const exact = hits.find((h) => h.value.toLowerCase() === q.toLowerCase());
+    return (exact || hits[0]).value;
+}
+
+/**
+ * Discover every perfume of a brand via Algolia faceting — free, no Cloudflare.
+ * @returns {Promise<{ facet: string|null, urls: string[], records: object[] }>}
+ */
+export async function fetchPerfumeUrlsByBrand(brand, limit = 500, maxPages = 200) {
+    const facet = (await resolveBrandFacetValue(brand)) || String(brand || '').trim();
+    const urls = [];
+    const records = [];
+    for (let page = 0; page < maxPages && urls.length < limit; page++) {
+        const data = await algoliaPost(`/1/indexes/${INDEX}/query`, {
+            query: '',
+            facetFilters: [[`dizajner:${facet}`]],
+            hitsPerPage: 1000,
+            page,
+            attributesToRetrieve: ['naslov', 'dizajner', 'objectID', 'id', 'slug', 'thumbnail', 'picture', 'godina'],
+        });
+        const hits = data?.hits || [];
+        for (const h of hits) {
+            const u = buildPerfumeUrlFromRecord(h);
+            if (u) { urls.push(u); records.push(h); }
+        }
+        if (data.page >= (data.nbPages || 1) - 1) break;
+        await sleep(150);
+    }
+    return { facet, urls: urls.slice(0, limit), records: records.slice(0, limit) };
+}
+
+/**
+ * Search perfumes by free-text name/query via Algolia — free, no Cloudflare.
+ * @returns {Promise<{ urls: string[], records: object[] }>}
+ */
+export async function searchPerfumeUrlsByName(query, limit = 50) {
+    const data = await algoliaPost(`/1/indexes/${INDEX}/query`, {
+        query: String(query || '').trim(),
+        hitsPerPage: Math.min(limit, 1000),
+        attributesToRetrieve: ['naslov', 'dizajner', 'objectID', 'id', 'slug', 'thumbnail', 'picture', 'godina'],
+    });
+    const records = data?.hits || [];
+    const urls = [];
+    for (const h of records) {
+        const u = buildPerfumeUrlFromRecord(h);
+        if (u) urls.push(u);
+    }
+    return { urls: urls.slice(0, limit), records: records.slice(0, limit) };
+}
