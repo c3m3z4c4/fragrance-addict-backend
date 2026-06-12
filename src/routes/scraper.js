@@ -431,17 +431,34 @@ router.post('/migrate-source-urls', requireSuperAdmin, async (req, res, next) =>
             if (oid) work.push({ id, sourceUrl, oid });
         }
 
-        const slugMap = await fetchSlugsByObjectIds(work.map((w) => w.oid));
-
+        // Process in small chunks, updating as we go so progress is persisted even
+        // if Algolia rate-limits us mid-run. On a persistent 429 we stop gracefully
+        // and return partial counts — the endpoint is idempotent, so re-running
+        // continues where it left off (already-.es rows are skipped up front).
+        const CHUNK = 20;
         let updated = 0, deletedDuplicates = 0, skipped = 0, unmapped = 0;
-        for (const w of work) {
-            const slug = slugMap.get(String(w.oid));
-            if (!slug) { unmapped++; continue; }
-            const newUrl = `${ES_PERFUME_PREFIX}${slug}-${w.oid}.html`;
-            if (newUrl === w.sourceUrl) { skipped++; continue; }
-            const result = await dataStore.migrateSourceUrl(w.id, newUrl);
-            if (result === 'updated') updated++;
-            else if (result === 'conflict') { await dataStore.delete(w.id); deletedDuplicates++; }
+        let stopped = false, stopReason = null;
+
+        for (let i = 0; i < work.length; i += CHUNK) {
+            const chunk = work.slice(i, i + CHUNK);
+            let slugMap;
+            try {
+                slugMap = await fetchSlugsByObjectIds(chunk.map((w) => w.oid), CHUNK);
+            } catch (err) {
+                stopped = true;
+                stopReason = err.message;
+                break;
+            }
+            for (const w of chunk) {
+                const slug = slugMap.get(String(w.oid));
+                if (!slug) { unmapped++; continue; }
+                const newUrl = `${ES_PERFUME_PREFIX}${slug}-${w.oid}.html`;
+                if (newUrl === w.sourceUrl) { skipped++; continue; }
+                const result = await dataStore.migrateSourceUrl(w.id, newUrl);
+                if (result === 'updated') updated++;
+                else if (result === 'conflict') { await dataStore.delete(w.id); deletedDuplicates++; }
+            }
+            await new Promise((r) => setTimeout(r, 400));
         }
 
         res.json({
@@ -453,6 +470,9 @@ router.post('/migrate-source-urls', requireSuperAdmin, async (req, res, next) =>
             deletedDuplicates,
             skipped,
             unmapped,
+            stopped,
+            stopReason,
+            remaining: stopped ? work.length - (updated + deletedDuplicates + skipped + unmapped) : 0,
         });
     } catch (err) {
         next(new ApiError(err.message, 500));
