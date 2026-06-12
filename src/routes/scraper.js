@@ -479,6 +479,39 @@ router.post('/migrate-source-urls', requireSuperAdmin, async (req, res, next) =>
     }
 });
 
+// GET /api/scrape/legacy-source-urls — list perfumes NOT yet on canonical .es.
+// Lets an off-server client (clean IP) resolve slugs without our Algolia rate limit.
+router.get('/legacy-source-urls', requireSuperAdmin, async (_req, res, next) => {
+    try {
+        const all = await dataStore.getAllIdSourceUrls();
+        const rows = all.filter((r) => !r.sourceUrl.startsWith(ES_PERFUME_PREFIX));
+        res.json({ success: true, total: all.length, legacy: rows.length, rows });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
+    }
+});
+
+// POST /api/scrape/apply-source-urls — apply externally-computed {id,url} mappings.
+// Body: { mappings: [{ id, url }] }. Repoints source_url; deletes rows whose
+// canonical URL already belongs to another row (duplicates).
+router.post('/apply-source-urls', requireSuperAdmin, async (req, res, next) => {
+    try {
+        const mappings = Array.isArray(req.body?.mappings) ? req.body.mappings : [];
+        if (!mappings.length) return next(new ApiError('mappings array is required', 400));
+        let updated = 0, deletedDuplicates = 0, skipped = 0;
+        for (const { id, url } of mappings) {
+            if (!id || !url) { skipped++; continue; }
+            const result = await dataStore.migrateSourceUrl(id, url);
+            if (result === 'updated') updated++;
+            else if (result === 'conflict') { await dataStore.delete(id); deletedDuplicates++; }
+            else skipped++;
+        }
+        res.json({ success: true, applied: mappings.length, updated, deletedDuplicates, skipped });
+    } catch (err) {
+        next(new ApiError(err.message, 500));
+    }
+});
+
 // POST /api/scrape/brand - Scraping automático de una marca completa
 router.post('/brand', requireSuperAdmin, async (req, res, next) => {
     try {
