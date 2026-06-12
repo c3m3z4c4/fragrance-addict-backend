@@ -407,7 +407,7 @@ async function fetchBrandUrls(brand, limit = 500) {
         .replace(/&/g, 'and')
         .replace(/\s+/g, '-')
         .replace(/[^A-Za-z0-9-]+/g, '');
-    const brandUrl = `https://www.fragrantica.com/designers/${brandSlug}.html`;
+    const brandUrl = `https://www.fragrantica.es/disenador/${brandSlug}.html`;
     const logoUrl = null;
 
     console.log(`  [algolia] Found ${urls.length} URLs for brand "${brand}" (facet: ${facet || 'n/a'})`);

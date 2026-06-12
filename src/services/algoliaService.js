@@ -314,7 +314,7 @@ export function buildPerfumeUrlFromRecord(record) {
     const slug = record.slug
         ? record.slug.replace(/^\/+|\/+$/g, '')
         : `${slugifyFragrantica(record.dizajner)}/${slugifyFragrantica(record.naslov)}`;
-    return `https://www.fragrantica.com/perfume/${slug}-${id}.html`;
+    return `https://www.fragrantica.es/perfume/${slug}-${id}.html`;
 }
 
 // Resolve a loosely-typed brand name to the EXACT facet value in the index

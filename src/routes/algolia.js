@@ -14,7 +14,7 @@ import express from 'express';
 import { dataStore } from '../services/dataStore.js';
 import { requireSuperAdmin, requireApiKey } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
-import { fetchFreshAlgoliaKey, algoliaKeyExpiry } from '../services/algoliaService.js';
+import { fetchFreshAlgoliaKey, algoliaKeyExpiry, buildPerfumeUrlFromRecord } from '../services/algoliaService.js';
 
 const router = express.Router();
 
@@ -70,12 +70,23 @@ function slugify(str) {
         .replace(/^-+|-+$/g, '');
 }
 
-function buildPerfumeUrl(record) {
-    const brandSlug = slugify(record.dizajner || '');
-    const nameSlug  = slugify(record.naslov   || '');
-    const id        = record.objectID;
-    return `https://www.fragrantica.com/perfume/${brandSlug}/${nameSlug}-${id}.html`;
+// Fragrantica's designer-page slug preserves the brand's original casing and
+// just dashes the spaces (e.g. "Maison Alhambra" → "Maison-Alhambra"). Used for
+// the .es/disenador/<Brand>.html brand page, NOT the lowercased internal slug.
+function brandPathSlug(str) {
+    return String(str || '')
+        .normalize('NFD').replace(/[̀-ͯ]/g, '')
+        .replace(/['’`]/g, '')
+        .replace(/&/g, 'and')
+        .replace(/\s+/g, '-')
+        .replace(/[^A-Za-z0-9-]+/g, '')
+        .replace(/^-+|-+$/g, '');
 }
+
+// Canonical perfume URL — delegates to the shared builder, which uses the
+// record's own `slug` field (correct casing, e.g. "Maison-Alhambra/Philos-Rosso")
+// on fragrantica.es. The old local slugify() lowercased everything and used .com.
+const buildPerfumeUrl = (record) => buildPerfumeUrlFromRecord(record);
 
 async function algoliaPost(path, body) {
     const key = getApiKey();
@@ -141,7 +152,7 @@ async function fetchPerfumesForBrand(brand, maxPages = 200) {
             facetFilters: [`dizajner:${brand}`],
             hitsPerPage: 1000,
             page,
-            attributesToRetrieve: ['naslov', 'dizajner', 'objectID'],
+            attributesToRetrieve: ['naslov', 'dizajner', 'objectID', 'slug'],
         });
         const hits = data.hits || [];
         hits.forEach(h => urls.push(buildPerfumeUrl(h)));
@@ -269,7 +280,7 @@ router.get('/brands', requireSuperAdmin, async (req, res, next) => {
                 name,
                 count,
                 slug: slugify(name),
-                url: `https://www.fragrantica.com/designers/${slugify(name)}.html`,
+                url: `https://www.fragrantica.es/disenador/${brandPathSlug(name)}.html`,
             }))
             .sort((a, b) => b.count - a.count);
         res.json({ success: true, total: list.length, brands: list });
