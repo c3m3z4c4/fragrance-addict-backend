@@ -684,6 +684,17 @@ export const dataStore = {
         return result.rows.map((r) => ({ id: r.id, sourceUrl: r.source_url }));
     },
 
+    // id + brand + name + source_url — used by the no-Algolia URL migration that
+    // reconstructs the canonical .es URL from stored fields (Fragrantica resolves
+    // by the trailing objectID, so an approximate slug still links correctly).
+    getAllForUrlMigration: async () => {
+        if (!isDatabaseConnected) return [];
+        const result = await pool.query(
+            'SELECT id, brand, name, source_url FROM perfumes WHERE source_url IS NOT NULL'
+        );
+        return result.rows.map((r) => ({ id: r.id, brand: r.brand, name: r.name, sourceUrl: r.source_url }));
+    },
+
     // Repoint one perfume to a new canonical source_url. If another row already
     // owns that URL (a duplicate), returns 'conflict' instead of violating the
     // unique constraint, so the caller can delete this row.
@@ -724,13 +735,18 @@ export const dataStore = {
             );
             return result.rowCount;
         } else {
-            // Normal mode: skip URLs already in queue OR already scraped in perfumes table
+            // Normal mode: skip URLs already in queue OR already scraped. Dedup by
+            // the Fragrantica objectID (digits before .html), so the same perfume
+            // is not re-queued when its URL domain/casing differs (.com vs .es).
             const values = urls.map((_, i) => `($${i + 1})`).join(', ');
             const result = await pool.query(
                 `INSERT INTO scrape_queue (url)
                  SELECT v.url FROM (VALUES ${values}) AS v(url)
                  WHERE NOT EXISTS (SELECT 1 FROM scrape_queue sq WHERE sq.url = v.url)
-                   AND NOT EXISTS (SELECT 1 FROM perfumes p WHERE p.source_url = v.url)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM perfumes p
+                     WHERE substring(p.source_url from '-(\\d+)\\.html') = substring(v.url from '-(\\d+)\\.html')
+                   )
                  ON CONFLICT (url) DO NOTHING`,
                 urls
             );
@@ -801,6 +817,27 @@ export const dataStore = {
             [url]
         );
         return result.rows.length > 0;
+    },
+
+    // Check existence by Fragrantica objectID (the digits before .html), which is
+    // stable across URL domain/casing changes — the canonical dedup key.
+    existsByObjectId: async (objectId) => {
+        if (!isDatabaseConnected || !objectId) return false;
+        const result = await pool.query(
+            `SELECT 1 FROM perfumes WHERE substring(source_url from '-(\\d+)\\.html') = $1 LIMIT 1`,
+            [String(objectId)]
+        );
+        return result.rows.length > 0;
+    },
+
+    // Full record by objectID (for force-update path).
+    getByObjectId: async (objectId) => {
+        if (!isDatabaseConnected || !objectId) return null;
+        const result = await pool.query(
+            `SELECT * FROM perfumes WHERE substring(source_url from '-(\\d+)\\.html') = $1 LIMIT 1`,
+            [String(objectId)]
+        );
+        return result.rows.length > 0 ? toCamelCase(result.rows[0]) : null;
     },
 
     // Get a perfume by its source URL (returns the full record including id)

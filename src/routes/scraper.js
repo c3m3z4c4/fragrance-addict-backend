@@ -3,7 +3,7 @@ import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { browserPool } from '../services/browserPool.js';
-import { getPerfumeViaAlgolia, fetchAlgoliaPerfume, fetchPerfumeUrlsByBrand, fetchSlugsByObjectIds, extractObjectIdFromUrl } from '../services/algoliaService.js';
+import { getPerfumeViaAlgolia, fetchAlgoliaPerfume, fetchPerfumeUrlsByBrand, extractObjectIdFromUrl, buildPerfumeUrlFromRecord } from '../services/algoliaService.js';
 import { enrichPerfumeWithAI, ENRICHABLE_FIELDS, DEFAULT_MIN_CONFIDENCE } from '../services/aiEnrichmentService.js';
 import { getActiveProvider } from './ai.js';
 import { getProxyConfig, fetchHtmlViaProxy, PROVIDER_IDS } from '../services/scrapeProxyService.js';
@@ -422,57 +422,31 @@ async function fetchBrandUrls(brand, limit = 500) {
 const ES_PERFUME_PREFIX = 'https://www.fragrantica.es/perfume/';
 router.post('/migrate-source-urls', requireSuperAdmin, async (req, res, next) => {
     try {
-        const all = await dataStore.getAllIdSourceUrls();
-        const work = [];
-        let alreadyEs = 0;
-        for (const { id, sourceUrl } of all) {
+        const all = await dataStore.getAllForUrlMigration();
+        let updated = 0, deletedDuplicates = 0, skipped = 0, unmapped = 0, alreadyEs = 0;
+
+        for (const { id, brand, name, sourceUrl } of all) {
             if (sourceUrl.startsWith(ES_PERFUME_PREFIX)) { alreadyEs++; continue; }
             const oid = extractObjectIdFromUrl(sourceUrl);
-            if (oid) work.push({ id, sourceUrl, oid });
-        }
-
-        // Process in small chunks, updating as we go so progress is persisted even
-        // if Algolia rate-limits us mid-run. On a persistent 429 we stop gracefully
-        // and return partial counts — the endpoint is idempotent, so re-running
-        // continues where it left off (already-.es rows are skipped up front).
-        const CHUNK = 20;
-        let updated = 0, deletedDuplicates = 0, skipped = 0, unmapped = 0;
-        let stopped = false, stopReason = null;
-
-        for (let i = 0; i < work.length; i += CHUNK) {
-            const chunk = work.slice(i, i + CHUNK);
-            let slugMap;
-            try {
-                slugMap = await fetchSlugsByObjectIds(chunk.map((w) => w.oid), CHUNK);
-            } catch (err) {
-                stopped = true;
-                stopReason = err.message;
-                break;
-            }
-            for (const w of chunk) {
-                const slug = slugMap.get(String(w.oid));
-                if (!slug) { unmapped++; continue; }
-                const newUrl = `${ES_PERFUME_PREFIX}${slug}-${w.oid}.html`;
-                if (newUrl === w.sourceUrl) { skipped++; continue; }
-                const result = await dataStore.migrateSourceUrl(w.id, newUrl);
-                if (result === 'updated') updated++;
-                else if (result === 'conflict') { await dataStore.delete(w.id); deletedDuplicates++; }
-            }
-            await new Promise((r) => setTimeout(r, 400));
+            if (!oid) { unmapped++; continue; }
+            // Reconstruct canonical .es URL from stored brand+name (no Algolia).
+            // Fragrantica resolves by the trailing objectID, so the slug need not be
+            // byte-exact; dedup is by objectID, so duplicates are prevented anyway.
+            const newUrl = buildPerfumeUrlFromRecord({ dizajner: brand, naslov: name, objectID: oid });
+            if (!newUrl || newUrl === sourceUrl) { skipped++; continue; }
+            const result = await dataStore.migrateSourceUrl(id, newUrl);
+            if (result === 'updated') updated++;
+            else if (result === 'conflict') { await dataStore.delete(id); deletedDuplicates++; }
         }
 
         res.json({
             success: true,
             scanned: all.length,
             alreadyCanonical: alreadyEs,
-            candidates: work.length,
             updated,
             deletedDuplicates,
             skipped,
             unmapped,
-            stopped,
-            stopReason,
-            remaining: stopped ? work.length - (updated + deletedDuplicates + skipped + unmapped) : 0,
         });
     } catch (err) {
         next(new ApiError(err.message, 500));
@@ -1117,7 +1091,12 @@ async function scrapeWorker(workerId) {
 
         try {
             if (!force) {
-                const alreadyExists = await dataStore.existsBySourceUrl(url).catch(() => false);
+                // Dedup by objectID, not exact URL — the same perfume under a
+                // different domain/casing (.com vs .es) must not be re-added.
+                const oid = extractObjectIdFromUrl(url);
+                const alreadyExists = oid
+                    ? await dataStore.existsByObjectId(oid).catch(() => false)
+                    : await dataStore.existsBySourceUrl(url).catch(() => false);
                 if (alreadyExists) {
                     console.log(`[worker-${workerId}] ⏭️ Already in DB: ${url}`);
                     await dataStore.queueMark(url, 'done');
@@ -1167,15 +1146,15 @@ async function scrapeWorker(workerId) {
             void dataSource;
 
             if (perfume) {
-                if (force) {
-                    const existing = await dataStore.getBySourceUrl(url).catch(() => null);
-                    if (existing) {
-                        await dataStore.update(existing.id, perfume);
-                        console.log(`[worker-${workerId}] 🔄 Updated: ${perfume.name}`);
-                    } else {
-                        await dataStore.add(perfume);
-                        console.log(`[worker-${workerId}] ✅ Saved (new): ${perfume.name}`);
-                    }
+                // Match an existing row by objectID (handles .com↔.es URL drift) so
+                // a re-scrape updates in place instead of inserting a duplicate.
+                const oid = extractObjectIdFromUrl(url);
+                const existing = oid
+                    ? await dataStore.getByObjectId(oid).catch(() => null)
+                    : await dataStore.getBySourceUrl(url).catch(() => null);
+                if (existing) {
+                    await dataStore.update(existing.id, perfume);
+                    console.log(`[worker-${workerId}] 🔄 Updated: ${perfume.name}`);
                 } else {
                     await dataStore.add(perfume);
                     console.log(`[worker-${workerId}] ✅ Saved: ${perfume.name}`);
