@@ -383,8 +383,10 @@ export async function resolveBrandFacetValue(brand) {
  * Discover every perfume of a brand via Algolia faceting — free, no Cloudflare.
  * @returns {Promise<{ facet: string|null, urls: string[], records: object[] }>}
  */
-export async function fetchPerfumeUrlsByBrand(brand, limit = 500, maxPages = 200) {
-    const facet = (await resolveBrandFacetValue(brand)) || String(brand || '').trim();
+export async function fetchPerfumeUrlsByBrand(brand, limit = 500, maxPages = 200, { alreadyResolved = false } = {}) {
+    const facet = alreadyResolved
+        ? String(brand || '').trim()
+        : (await resolveBrandFacetValue(brand)) || String(brand || '').trim();
     const urls = [];
     const records = [];
     for (let page = 0; page < maxPages && urls.length < limit; page++) {
@@ -443,14 +445,18 @@ export async function discoverFullCatalogViaAlgolia({ limitPerBrand = 5000, onPr
     let done = 0;
     for (const brand of brands) {
         try {
-            const { urls } = await fetchPerfumeUrlsByBrand(brand, limitPerBrand);
+            // alreadyResolved=true: `brand` came straight out of fetchAllBrandFacets,
+            // so it IS the exact facet value already — skip the redundant
+            // resolveBrandFacetValue() call that was doubling our Algolia request
+            // rate and tripping 429s after ~70 brands.
+            const { urls } = await fetchPerfumeUrlsByBrand(brand, limitPerBrand, 200, { alreadyResolved: true });
             urls.forEach(u => allUrls.add(u));
-            await sleep(400);
+            await sleep(600);
         } catch (err) {
             console.warn(`[algolia] discover "${brand}" failed: ${err.message}`);
             // Rate-limited: back off hard instead of immediately hammering the next
             // brand (which was just re-triggering more 429s and stalling progress).
-            if (/RATE_LIMITED/.test(err.message)) await sleep(10000);
+            if (/RATE_LIMITED/.test(err.message)) await sleep(20000);
         }
         done++;
         if (typeof onProgress === 'function') {
