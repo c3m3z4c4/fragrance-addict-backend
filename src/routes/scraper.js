@@ -3,7 +3,7 @@ import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import { scrapePerfume } from '../services/scrapingService.js';
 import { browserPool } from '../services/browserPool.js';
-import { getPerfumeViaAlgolia, fetchAlgoliaPerfume, fetchPerfumeUrlsByBrand, extractObjectIdFromUrl, buildPerfumeUrlFromRecord } from '../services/algoliaService.js';
+import { getPerfumeViaAlgolia, fetchAlgoliaPerfume, fetchPerfumeUrlsByBrand, extractObjectIdFromUrl, buildPerfumeUrlFromRecord, discoverFullCatalogViaAlgolia } from '../services/algoliaService.js';
 import { enrichPerfumeWithAI, ENRICHABLE_FIELDS, DEFAULT_MIN_CONFIDENCE } from '../services/aiEnrichmentService.js';
 import { getActiveProvider } from './ai.js';
 import { getProxyConfig, fetchHtmlViaProxy, PROVIDER_IDS } from '../services/scrapeProxyService.js';
@@ -1685,6 +1685,69 @@ router.post('/catalog/full', requireSuperAdmin, async (req, res, _next) => {
             catalogDiscovery.finishedAt = new Date().toISOString();
         } catch (err) {
             console.error('[bg] ❌ Full catalog discovery error:', err.message);
+            catalogDiscovery.active = false;
+            catalogDiscovery.phase = 'error';
+            catalogDiscovery.error = err.message;
+            catalogDiscovery.finishedAt = new Date().toISOString();
+        }
+    });
+});
+
+// POST /api/scrape/catalog/full-algolia - Discover & queue the ENTIRE catalogue
+// via Algolia brand faceting. This REPLACES /catalog/full, whose XML-sitemap crawl
+// is dead (Fragrantica returns 404 for sitemap.xml and sitemap_perfumes_N.xml).
+// Free, no Cloudflare, no proxy. Responds 202 immediately; runs in background.
+router.post('/catalog/full-algolia', requireSuperAdmin, async (req, res, _next) => {
+    const { autoStart = true, limitPerBrand = 5000 } = req.body || {};
+
+    if (catalogDiscovery.active) {
+        return res.json({ success: false, error: 'Catalog discovery already running', catalogDiscovery });
+    }
+
+    res.json({
+        success: true,
+        status: 'discovering',
+        message: 'Descubrimiento del catálogo completo vía Algolia iniciado en segundo plano. Las URLs se van agregando a la cola — revisa el panel de la cola.',
+    });
+
+    setImmediate(async () => {
+        catalogDiscovery = {
+            active: true,
+            phase: 'reading_brands',
+            currentSitemap: null,
+            sitemapsTotal: 0,
+            sitemapsProcessed: 0,
+            urlsFound: 0,
+            urlsQueued: 0,
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+            error: null,
+        };
+        try {
+            const existingUrls = new Set(await dataStore.getAllSourceUrls().catch(() => []));
+            const { urls, brands } = await discoverFullCatalogViaAlgolia({
+                limitPerBrand: parseInt(limitPerBrand),
+                onProgress: (s) => {
+                    catalogDiscovery.phase = 'reading_sitemaps';
+                    catalogDiscovery.sitemapsTotal = s.brandsTotal;
+                    catalogDiscovery.sitemapsProcessed = s.brandsProcessed;
+                    catalogDiscovery.currentSitemap = s.currentBrand;
+                    catalogDiscovery.urlsFound = s.urlsFound;
+                },
+            });
+
+            catalogDiscovery.phase = 'enqueueing';
+            catalogDiscovery.currentSitemap = null;
+            const newUrls = urls.filter(u => !existingUrls.has(u));
+            const added = await enqueueUrls(newUrls, autoStart);
+            catalogDiscovery.urlsQueued = added;
+
+            console.log(`✅ [algolia] Full catalog: ${brands.length} brands, ${urls.length} URLs found, ${added} new queued`);
+            catalogDiscovery.active = false;
+            catalogDiscovery.phase = 'done';
+            catalogDiscovery.finishedAt = new Date().toISOString();
+        } catch (err) {
+            console.error('[algolia] Full catalog discovery error:', err.message);
             catalogDiscovery.active = false;
             catalogDiscovery.phase = 'error';
             catalogDiscovery.error = err.message;

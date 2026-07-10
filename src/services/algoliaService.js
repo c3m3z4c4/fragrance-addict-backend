@@ -407,6 +407,56 @@ export async function fetchPerfumeUrlsByBrand(brand, limit = 500, maxPages = 200
 }
 
 /**
+ * Enumerate EVERY brand (designer) facet value in the index — free, no Cloudflare.
+ * Fragrantica no longer publishes XML sitemaps (sitemap.xml → 404), so brand
+ * faceting is now the only reliable way to discover the whole catalogue.
+ * Sweeps facetQuery across a..z + 0-9 + '' and unions the results.
+ * @returns {Promise<string[]>} sorted, de-duplicated brand facet values
+ */
+export async function fetchAllBrandFacets() {
+    const prefixes = 'abcdefghijklmnopqrstuvwxyz0123456789'.split('').concat(['']);
+    const brands = new Set();
+    for (const prefix of prefixes) {
+        try {
+            const data = await algoliaPost(
+                `/1/indexes/${INDEX}/facets/dizajner/query`,
+                { facetQuery: prefix, maxFacetHits: 100 }
+            );
+            for (const hit of (data?.facetHits || [])) brands.add(hit.value);
+        } catch (err) {
+            console.warn(`[algolia] brand facet sweep "${prefix}" failed: ${err.message}`);
+        }
+        await sleep(120);
+    }
+    return [...brands].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * Discover the ENTIRE Fragrantica catalogue via Algolia brand faceting.
+ * Replaces the dead sitemap crawl. Streams progress through onProgress(state).
+ * @returns {Promise<{ urls: string[], brands: string[] }>}
+ */
+export async function discoverFullCatalogViaAlgolia({ limitPerBrand = 5000, onProgress } = {}) {
+    const brands = await fetchAllBrandFacets();
+    const allUrls = new Set();
+    let done = 0;
+    for (const brand of brands) {
+        try {
+            const { urls } = await fetchPerfumeUrlsByBrand(brand, limitPerBrand);
+            urls.forEach(u => allUrls.add(u));
+        } catch (err) {
+            console.warn(`[algolia] discover "${brand}" failed: ${err.message}`);
+        }
+        done++;
+        if (typeof onProgress === 'function') {
+            onProgress({ brandsTotal: brands.length, brandsProcessed: done, currentBrand: brand, urlsFound: allUrls.size });
+        }
+        await sleep(150);
+    }
+    return { urls: [...allUrls], brands };
+}
+
+/**
  * Search perfumes by free-text name/query via Algolia — free, no Cloudflare.
  * @returns {Promise<{ urls: string[], records: object[] }>}
  */

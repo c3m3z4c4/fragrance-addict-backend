@@ -314,7 +314,17 @@ function extractYear($, ld) {
 
 // Extraer perfumista/nariz — returns { name: string|null, imageUrl: string|null }
 function extractPerfumerData($) {
-    const perfumerLinks = $('a[href*="/noses/"]');
+    // Fragrantica localises the perfumer path per domain: /noses/ (.com),
+    // /perfumista/ (.es), /nase/ (.de), /nez/ (.fr), /perfumers/ … Match all.
+    const perfumerLinks = $(
+        'a[href*="/noses/"], a[href*="/perfumista"], a[href*="/perfumers/"], ' +
+        'a[href*="/nase/"], a[href*="/nez/"], a[href*="/perfumer/"]'
+    ).filter((_, el) => {
+        // Exclude the section-heading link ("Perfumistas"/"Perfumers") which points
+        // to the index, not an individual perfumer.
+        const href = $(el).attr('href') || '';
+        return /\/(noses|perfumista|perfumers|nase|nez|perfumer)\/[^/]+/.test(href);
+    });
     if (perfumerLinks.length) {
         const perfumers = [];
         let firstImageUrl = null;
@@ -557,10 +567,51 @@ function extractNotes($) {
     return notes;
 }
 
+// Words that also render as inline width-bars but are NOT accords (seasons,
+// day/night, and performance labels across EN/ES). Used to filter Strategy 0.
+const NON_ACCORD_LABELS = new Set([
+    // seasons / time (ES + EN)
+    'invierno', 'primavera', 'verano', 'otoño', 'otono', 'día', 'dia', 'noche',
+    'winter', 'spring', 'summer', 'fall', 'autumn', 'day', 'night',
+    // performance labels sometimes rendered as bars
+    'estela', 'sillage', 'longevidad', 'duración', 'duracion', 'longevity',
+    'proyección', 'proyeccion', 'projection', 'precio', 'price', 'valor', 'value',
+]);
+
 // Extraer acordes principales — returns string[] ordered by prominence
 function extractAccords($) {
     const clean = (text) =>
         text.replace(/\d[\d,.]*/g, '').replace(/votes?/gi, '').replace(/\s+/g, ' ').trim();
+
+    // ── Strategy 0: Modern (2024+) Tailwind/React markup ─────────────────────
+    // Fragrantica rebuilt its front-end: accord bars no longer use `.accord-bar`.
+    // Each accord is now a <div style="...background:rgb(..);width:X%"> whose label
+    // sits in a child <span class="truncate"> (or as the div's own text). We select
+    // width-bars that ALSO carry a background colour (accords are always coloured),
+    // read the % from the inline width, sort by prominence, and drop season/perf
+    // bars via NON_ACCORD_LABELS.
+    const modern = [];
+    $('div[style*="width"]').each((_, el) => {
+        const style = $(el).attr('style') || '';
+        if (!/background/i.test(style)) return;              // accords are colour-filled
+        const widthMatch = style.match(/width:\s*([\d.]+)%/);
+        if (!widthMatch) return;
+        const span = $(el).children('span').first().text().trim();
+        const name = (span || getOwnText(el) || $(el).text()).replace(/\s+/g, ' ').trim();
+        if (!name || name.length < 2 || name.length > 40) return;
+        if (/^\d/.test(name)) return;                        // pure numbers / percentages
+        if (NON_ACCORD_LABELS.has(name.toLowerCase())) return;
+        modern.push({ name, pct: parseFloat(widthMatch[1]) });
+    });
+    if (modern.length > 0) {
+        // Keep document order for ties; sort by width desc (prominence)
+        const seen = new Set();
+        const ordered = modern
+            .sort((a, b) => b.pct - a.pct)
+            .map(a => a.name)
+            .filter(n => { const k = n.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+        if (ordered.length > 0) return ordered;
+    }
 
     // ── Strategy 1: .accord-bar elements with an inline width style ──────────
     const withWidth = [];
