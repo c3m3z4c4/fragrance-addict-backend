@@ -425,8 +425,9 @@ export async function fetchAllBrandFacets() {
             for (const hit of (data?.facetHits || [])) brands.add(hit.value);
         } catch (err) {
             console.warn(`[algolia] brand facet sweep "${prefix}" failed: ${err.message}`);
+            if (/RATE_LIMITED/.test(err.message)) await sleep(10000);
         }
-        await sleep(120);
+        await sleep(300);
     }
     return [...brands].sort((a, b) => a.localeCompare(b));
 }
@@ -444,14 +445,17 @@ export async function discoverFullCatalogViaAlgolia({ limitPerBrand = 5000, onPr
         try {
             const { urls } = await fetchPerfumeUrlsByBrand(brand, limitPerBrand);
             urls.forEach(u => allUrls.add(u));
+            await sleep(400);
         } catch (err) {
             console.warn(`[algolia] discover "${brand}" failed: ${err.message}`);
+            // Rate-limited: back off hard instead of immediately hammering the next
+            // brand (which was just re-triggering more 429s and stalling progress).
+            if (/RATE_LIMITED/.test(err.message)) await sleep(10000);
         }
         done++;
         if (typeof onProgress === 'function') {
             onProgress({ brandsTotal: brands.length, brandsProcessed: done, currentBrand: brand, urlsFound: allUrls.size });
         }
-        await sleep(150);
     }
     return { urls: [...allUrls], brands };
 }
