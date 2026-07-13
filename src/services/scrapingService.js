@@ -221,11 +221,18 @@ function extractName($, ld) {
         if (n) return n;
     }
 
-    const h1Text = $('h1[itemprop="name"]').text().trim();
+    // Modern markup puts the gender inside a child <span> of the h1
+    // ("Name Brand <span>para Hombres</span>") — read the h1 WITHOUT child
+    // elements first, falling back to full text for the legacy layout.
+    const $h1 = $('h1[itemprop="name"]').first();
+    const h1Own = $h1.length ? getOwnText($h1.get(0)).replace(/\s+/g, ' ').trim() : '';
+    const h1Text = (h1Own || $h1.text()).replace(/\s+/g, ' ').trim();
     if (h1Text) {
-        // Remover el género (for men, for women) y la marca
+        // Remover el género (EN/ES/FR) y la marca
         const cleanName = h1Text
-            .replace(/\s+for\s+(men|women|women and men)\s*$/i, '')
+            .replace(/\s+for\s+(men and women|women and men|men|women)\s*$/i, '')
+            .replace(/\s+para\s+(hombres y mujeres|mujeres y hombres|hombres|mujeres)\s*$/i, '')
+            .replace(/\s+pour\s+(homme|femme)\s*$/i, '')
             .trim();
 
         // La marca está al final, separar nombre de marca
@@ -291,8 +298,11 @@ function extractYear($, ld) {
 
     const bodyText = $('body').text();
 
-    // Buscar patrones comunes en Fragrantica
+    // Buscar patrones comunes en Fragrantica (EN + ES). The bare "(YYYY)"
+    // pattern goes LAST — body text is full of user-review years and it was
+    // grabbing the first random one.
     const patterns = [
+        /se\s+lanz[oó]\s+en\s+(?:el\s+año\s+)?(\d{4})/i,
         /launched\s+in\s+(\d{4})/i,
         /was\s+launched\s+in\s+(\d{4})/i,
         /from\s+(\d{4})/i,
@@ -323,7 +333,10 @@ function extractPerfumerData($) {
         // Exclude the section-heading link ("Perfumistas"/"Perfumers") which points
         // to the index, not an individual perfumer.
         const href = $(el).attr('href') || '';
-        return /\/(noses|perfumista|perfumers|nase|nez|perfumer)\/[^/]+/.test(href);
+        // Individual perfumer pages only — .es uses /perfumistas/Name.html
+        // (plural); the bare index ("/perfumistas/") has nothing after the
+        // slash and is rejected.
+        return /\/(noses|perfumistas?|perfumers?|nase|nez)\/[^/]+/.test(href);
     });
     if (perfumerLinks.length) {
         const perfumers = [];
@@ -348,9 +361,13 @@ function extractPerfumerData($) {
         }
     }
 
-    // Fallback: buscar texto con "created by" o "nose"
+    // Fallback: intro sentence (EN "The Nose behind this fragrance is …" /
+    // ES "La Nariz detrás de esta fragrancia es …"). Case-sensitive capture so
+    // random lowercase review text can't match.
     const text = $('body').text();
-    const match = text.match(/(?:created\s+by|nose[s]?:?)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/i);
+    const match = text.match(
+        /(?:[Nn]ariz\s+detr[aá]s\s+de\s+esta\s+fragr?ancia\s+es|[Nn]ose\s+behind\s+this\s+fragrance\s+is|created\s+by)\s+([A-ZÀ-Ž][\w'’.-]+(?:\s+[A-ZÀ-Ž][\w'’.-]+)+)/
+    );
     if (match) return { name: match[1].trim(), imageUrl: null };
 
     return { name: null, imageUrl: null };
@@ -360,32 +377,19 @@ function extractPerfumerData($) {
 function extractGender($) {
     const h1Text = $('h1[itemprop="name"]').text().toLowerCase();
 
-    if (h1Text.includes('for women and men')) {
-        return 'unisex';
-    }
-    if (h1Text.includes('for women') || h1Text.includes('pour femme')) {
-        return 'feminine';
-    }
-    if (h1Text.includes('for men') || h1Text.includes('pour homme')) {
-        return 'masculine';
-    }
-    if (h1Text.includes('unisex')) {
-        return 'unisex';
-    }
+    const classify = (t) => {
+        if (/for women and men|for men and women|para hombres y mujeres|para mujeres y hombres|unisex/.test(t)) return 'unisex';
+        if (/for women|pour femme|para mujeres/.test(t)) return 'feminine';
+        if (/for men|pour homme|para hombres/.test(t)) return 'masculine';
+        return null;
+    };
+
+    const fromH1 = classify(h1Text);
+    if (fromH1) return fromH1;
 
     // Buscar en el cuerpo del texto
-    const bodyText = $('body').text().toLowerCase();
-    if (bodyText.includes('for women and men') || bodyText.includes('unisex')) {
-        return 'unisex';
-    }
-    if (bodyText.includes('for women')) {
-        return 'feminine';
-    }
-    if (bodyText.includes('for men')) {
-        return 'masculine';
-    }
-
-    return 'unisex';
+    const fromBody = classify($('body').text().toLowerCase());
+    return fromBody || 'unisex';
 }
 
 // Extraer concentración
@@ -789,6 +793,12 @@ const SILLAGE_LABELS = {
 };
 
 function extractPerformanceMetric($, metric) {
+    // Modern (2024+) markup renders longevity/sillage as client-side custom
+    // elements (<longevity-rating-new>, <sillage-rating-new>) hydrated via XHR —
+    // the static HTML contains NO vote data. The fuzzy strategies below would
+    // otherwise scrape random numbers out of user reviews, so bail out early.
+    if ($('longevity-rating-new, sillage-rating-new').length) return null;
+
     const labelMap = metric === 'longevity' ? LONGEVITY_LABELS : SILLAGE_LABELS;
     const votes = {};
 
@@ -879,6 +889,11 @@ function extractPerformanceMetric($, metric) {
 
 // Extraer rating
 function extractSeasonUsage($) {
+    // Modern markup: seasons widget is a client-side custom element hydrated
+    // via XHR (<seasons-rating-new>) — no data in static HTML. Bail out early
+    // so the fuzzy scan below doesn't pick numbers out of review text.
+    if ($('seasons-rating-new').length) return null;
+
     const result = { winter: 0, spring: 0, summer: 0, autumn: 0, day: 0, night: 0 };
     let found = false;
 
