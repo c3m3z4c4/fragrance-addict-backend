@@ -1110,40 +1110,49 @@ async function scrapeWorker(workerId) {
 
             console.log(`[worker-${workerId}] 🔄 Scraping${force ? ' (force)' : ''}: ${url}`);
 
-            // Try Algolia first — bypasses Cloudflare entirely. Falls through to
-            // Puppeteer scrape on any failure (missing key, no record, network error).
+            // With a scraping proxy configured, HTML is the primary source — it has
+            // the FULL data (accords, notes, perfumer, seasons, performance) while
+            // Algolia only carries basics. Algolia remains the fallback when the
+            // proxy fails, and the only source when no proxy is configured.
             let perfume = null;
             let dataSource = null;
-            try {
-                perfume = await getPerfumeViaAlgolia(url);
-                if (perfume) {
-                    dataSource = 'algolia';
-                    console.log(`[worker-${workerId}] 📚 Algolia: ${perfume.name}`);
-                }
-            } catch (err) {
-                const m = String(err.message);
-                // Rate limiting is transient — rethrow so the URL is deferred and
-                // retried with backoff, NOT permanently failed as "not found".
-                if (m.includes('RATE_LIMITED') || m.includes('429') || /too many requests/i.test(m)) {
-                    throw new Error(`RATE_LIMITED: Algolia ${m}`);
-                }
-                // ALGOLIA_KEY_MISSING is expected when no key configured — silent.
-                if (!m.includes('ALGOLIA_KEY_MISSING')) {
-                    console.warn(`[worker-${workerId}] Algolia failed (${m}) — falling back`);
+            if (getProxyConfig().configured) {
+                try {
+                    perfume = await scrapePerfume(url);
+                    dataSource = 'scrape';
+                } catch (err) {
+                    const m = String(err.message);
+                    if (m.includes('RATE_LIMITED')) throw err;
+                    console.warn(`[worker-${workerId}] HTML scrape failed (${m}) — falling back to Algolia`);
                 }
             }
 
             if (!perfume) {
-                // Free mode: if Algolia has no record and no scraping proxy is
-                // configured, skip rather than launch Puppeteer — Cloudflare blocks
-                // our VPS IP (zero data) and Chromium spikes CPU. Only fall back to
-                // HTML scraping when a proxy is actually configured.
-                if (getProxyConfig().configured) {
-                    perfume = await scrapePerfume(url);
-                    dataSource = 'scrape';
-                } else {
-                    throw new Error('INVALID_DATA: not found in Algolia (no scraping proxy configured)');
+                try {
+                    perfume = await getPerfumeViaAlgolia(url);
+                    if (perfume) {
+                        dataSource = 'algolia';
+                        console.log(`[worker-${workerId}] 📚 Algolia: ${perfume.name}`);
+                    }
+                } catch (err) {
+                    const m = String(err.message);
+                    // Rate limiting is transient — rethrow so the URL is deferred and
+                    // retried with backoff, NOT permanently failed as "not found".
+                    if (m.includes('RATE_LIMITED') || m.includes('429') || /too many requests/i.test(m)) {
+                        throw new Error(`RATE_LIMITED: Algolia ${m}`);
+                    }
+                    // ALGOLIA_KEY_MISSING is expected when no key configured — silent.
+                    if (!m.includes('ALGOLIA_KEY_MISSING')) {
+                        console.warn(`[worker-${workerId}] Algolia failed (${m})`);
+                    }
                 }
+            }
+
+            if (!perfume && !getProxyConfig().configured) {
+                // Free mode with no record anywhere: skip rather than launch
+                // Puppeteer — Cloudflare blocks our VPS IP (zero data) and
+                // Chromium spikes CPU.
+                throw new Error('INVALID_DATA: not found in Algolia (no scraping proxy configured)');
             }
             void dataSource;
 

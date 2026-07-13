@@ -419,6 +419,11 @@ function extractConcentration($) {
 function extractNotes($) {
     const notes = { top: [], heart: [], base: [] };
 
+    // Fragrantica localises the note path per domain: /notes/ (.com), /notas/
+    // (.es), /noten/ (.de), /notes/ (.fr). Match them all.
+    const NOTE_HREF_RE = /\/(notes|notas|noten|note)\//;
+    const NOTE_LINK_SEL = 'a[href*="/notes/"], a[href*="/notas/"], a[href*="/noten/"]';
+
     // Helper: get clean note text from a link element
     const getNoteText = (el) => {
         const $el = $(el);
@@ -466,7 +471,7 @@ function extractNotes($) {
 
             if (tag === 'a' && currentSection) {
                 const href = $(el).attr('href') || '';
-                if (href.includes('/notes/')) {
+                if (NOTE_HREF_RE.test(href)) {
                     const noteText = getNoteText(el);
                     if (noteText && noteText.length < 80) notes[currentSection].push(noteText);
                 }
@@ -495,7 +500,7 @@ function extractNotes($) {
                 const $el = $(el);
                 const candidates = [$el.parent(), $el.parent().next(), $el.next(), $el.next().next()];
                 for (const $c of candidates) {
-                    $c.find('a[href*="/notes/"]').each((_, a) => {
+                    $c.find(NOTE_LINK_SEL).each((_, a) => {
                         const noteText = getNoteText(a);
                         if (noteText && noteText.length < 80) notes[key].push(noteText);
                     });
@@ -509,7 +514,7 @@ function extractNotes($) {
     // ── Strategy 3: Walk header-bearing tags + /notes/ links only ────────────
     // Restricted to relevant tags (was `$('*')` — walked 5-10k nodes per page).
     let currentSection = null;
-    $('h1, h2, h3, h4, h5, b, strong, span, p, label, div, a[href*="/notes/"]').each((_, el) => {
+    $('h1, h2, h3, h4, h5, b, strong, span, p, label, div, ' + NOTE_LINK_SEL).each((_, el) => {
         const tag = el.tagName?.toLowerCase();
         if (!tag) return;
 
@@ -519,7 +524,7 @@ function extractNotes($) {
 
         if (tag === 'a' && currentSection) {
             const href = $(el).attr('href') || '';
-            if (href.includes('/notes/')) {
+            if (NOTE_HREF_RE.test(href)) {
                 const noteText = getNoteText(el);
                 if (noteText && noteText.length < 80) notes[currentSection].push(noteText);
             }
@@ -537,7 +542,7 @@ function extractNotes($) {
 
     if (headers.length >= 2) {
         // For each note link, find the closest preceding header
-        $('a[href*="/notes/"]').each((_, a) => {
+        $(NOTE_LINK_SEL).each((_, a) => {
             const noteText = getNoteText(a);
             if (!noteText || noteText.length >= 80) return;
 
@@ -556,7 +561,7 @@ function extractNotes($) {
     // ── Final fallback: all /notes/ links, unclassified → heart ─────────────
     // Keeps notes visible in the UI while signalling the pyramid couldn't be parsed.
     const allNotes = new Set();
-    $('a[href*="/notes/"]').each((_, el) => {
+    $(NOTE_LINK_SEL).each((_, el) => {
         const noteText = getNoteText(el);
         if (noteText && noteText.length < 80 && !/^notes?$/i.test(noteText)) {
             allNotes.add(noteText);
