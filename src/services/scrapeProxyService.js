@@ -38,6 +38,32 @@ function basicAuth(key) {
 }
 
 const PROVIDERS = {
+    jina: {
+        label: 'Jina Reader (gratis)',
+        signupUrl: 'https://jina.ai/reader',
+        // r.jina.ai renders the page (JS + Cloudflare solved on Jina's infra) and
+        // returns it for free. `X-Return-Format: html` gives the full rendered DOM,
+        // which contains the modern accord bars / season / performance widgets our
+        // extractors parse. No API key required (IP rate limit ~20 req/min); an
+        // optional key raises the limit via Authorization: Bearer.
+        keyOptional: true,
+        request: (key, url) => ({
+            endpoint: `https://r.jina.ai/${url}`,
+            init: {
+                method: 'GET',
+                headers: {
+                    'X-Return-Format': 'html',
+                    ...(key ? { 'Authorization': `Bearer ${key}` } : {}),
+                },
+            },
+        }),
+        parse: (text) => {
+            if (/just a moment|cf-browser-verification/i.test(text.slice(0, 2000))) {
+                throw new Error('Jina returned a Cloudflare challenge page');
+            }
+            return text;
+        },
+    },
     decodo: {
         label: 'Decodo',
         signupUrl: 'https://decodo.com',
@@ -123,7 +149,7 @@ export function getProxyConfig() {
     return {
         provider: def ? provider : null,
         label: def?.label || null,
-        configured: !!(def && key),
+        configured: !!(def && (key || def.keyOptional)),
         geo: GEO || null,
         availableProviders: Object.entries(PROVIDERS).map(([id, d]) => ({ id, label: d.label, signupUrl: d.signupUrl })),
     };
@@ -144,7 +170,7 @@ export async function fetchHtmlViaProxy(url, opts = {}) {
     const key = process.env.SCRAPER_API_KEY || '';
     const def = PROVIDERS[provider];
     if (!def) throw new Error(`SCRAPER_PROXY_MISSING: set SCRAPER_API_PROVIDER (${PROVIDER_IDS.join('|')})`);
-    if (!key) throw new Error('SCRAPER_PROXY_MISSING: set SCRAPER_API_KEY');
+    if (!key && !def.keyOptional) throw new Error('SCRAPER_PROXY_MISSING: set SCRAPER_API_KEY');
 
     const render = opts.render !== false;
     const timeoutMs = opts.timeoutMs || 70000;

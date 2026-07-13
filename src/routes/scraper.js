@@ -169,11 +169,13 @@ router.post('/proxy/config', requireSuperAdmin, (req, res, next) => {
     if (!PROVIDER_IDS.includes((provider || '').toLowerCase())) {
         return next(new ApiError(`provider must be one of: ${PROVIDER_IDS.join(', ')}`, 400));
     }
-    if (!apiKey || typeof apiKey !== 'string' || !apiKey.trim()) {
+    // Jina works without a key (free tier); every other provider requires one.
+    const keyless = provider.toLowerCase() === 'jina';
+    if (!keyless && (!apiKey || typeof apiKey !== 'string' || !apiKey.trim())) {
         return next(new ApiError('apiKey is required', 400));
     }
     process.env.SCRAPER_API_PROVIDER = provider.toLowerCase();
-    process.env.SCRAPER_API_KEY = apiKey.trim();
+    process.env.SCRAPER_API_KEY = (typeof apiKey === 'string' ? apiKey.trim() : '');
     res.json({
         success: true,
         ...getProxyConfig(),
