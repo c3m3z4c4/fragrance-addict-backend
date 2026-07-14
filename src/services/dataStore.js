@@ -1511,7 +1511,7 @@ export const dataStore = {
         )
       )
         AND source_url IS NOT NULL
-      ORDER BY created_at DESC
+      ORDER BY rating DESC NULLS LAST, created_at DESC
       LIMIT $1
     `;
         const result = await pool.query(query, [limit]);
