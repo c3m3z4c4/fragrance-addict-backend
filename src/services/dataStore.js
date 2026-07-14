@@ -897,6 +897,66 @@ export const dataStore = {
         return toCamelCase(result.rows[0]);
     },
 
+    /**
+     * Similar perfumes by SHARED NOTES across the whole catalogue.
+     * Score: a shared note in the SAME pyramid phase (top/heart/base) = 2 pts,
+     * in a different phase = 1 pt — more shared notes = more similar, with
+     * phase alignment weighting the ranking. Requires at least `minShared`
+     * distinct shared notes to qualify (filters coincidental single-note hits).
+     */
+    getSimilarByNotes: async (id, { limit = 8, minShared = 2 } = {}) => {
+        if (!isDatabaseConnected) return [];
+        const result = await pool.query(
+            `
+            WITH target_notes AS (
+                SELECT DISTINCT lower(trim(x.note)) AS note, x.phase
+                FROM perfumes tp, LATERAL (
+                    SELECT jsonb_array_elements_text(COALESCE(tp.notes->'top',   '[]'::jsonb)) AS note, 'top'   AS phase
+                    UNION ALL
+                    SELECT jsonb_array_elements_text(COALESCE(tp.notes->'heart', '[]'::jsonb)), 'heart'
+                    UNION ALL
+                    SELECT jsonb_array_elements_text(COALESCE(tp.notes->'base',  '[]'::jsonb)), 'base'
+                ) x
+                WHERE tp.id = $1 AND trim(x.note) <> ''
+            ),
+            candidate_notes AS (
+                SELECT DISTINCT p.id, lower(trim(n.note)) AS note, n.phase
+                FROM perfumes p, LATERAL (
+                    SELECT jsonb_array_elements_text(COALESCE(p.notes->'top',   '[]'::jsonb)) AS note, 'top'   AS phase
+                    UNION ALL
+                    SELECT jsonb_array_elements_text(COALESCE(p.notes->'heart', '[]'::jsonb)), 'heart'
+                    UNION ALL
+                    SELECT jsonb_array_elements_text(COALESCE(p.notes->'base',  '[]'::jsonb)), 'base'
+                ) n
+                WHERE p.id <> $1 AND trim(n.note) <> ''
+            ),
+            scored AS (
+                SELECT
+                    c.id,
+                    SUM(CASE WHEN c.phase = t.phase THEN 2 ELSE 1 END) AS score,
+                    COUNT(DISTINCT c.note) AS shared_notes,
+                    COUNT(*) FILTER (WHERE c.phase = t.phase) AS same_phase_matches
+                FROM candidate_notes c
+                JOIN target_notes t ON t.note = c.note
+                GROUP BY c.id
+                HAVING COUNT(DISTINCT c.note) >= $3
+            )
+            SELECT p.*, s.score AS similarity_score, s.shared_notes, s.same_phase_matches
+            FROM scored s
+            JOIN perfumes p ON p.id = s.id
+            ORDER BY s.score DESC, s.shared_notes DESC, p.rating DESC NULLS LAST
+            LIMIT $2
+            `,
+            [id, limit, minShared]
+        );
+        return result.rows.map((row) => ({
+            ...toCamelCase(row),
+            similarityScore: parseInt(row.similarity_score, 10),
+            sharedNotes: parseInt(row.shared_notes, 10),
+            samePhaseMatches: parseInt(row.same_phase_matches, 10),
+        }));
+    },
+
     // Buscar por marca
     getByBrand: async (brand) => {
         if (!isDatabaseConnected) {

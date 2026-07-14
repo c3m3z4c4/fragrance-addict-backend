@@ -129,6 +129,19 @@ router.get('/perfumer/:name', async (req, res, next) => {
 });
 
 // GET /api/perfumes/:id - Detalle
+// GET /api/perfumes/:id/similar - Similar perfumes ranked by shared notes
+// (same-phase matches weigh double; more shared notes = more similar)
+router.get('/:id/similar', async (req, res, next) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 8, 24);
+        const minShared = Math.max(parseInt(req.query.minShared) || 2, 1);
+        const similar = await dataStore.getSimilarByNotes(req.params.id, { limit, minShared });
+        res.json({ success: true, count: similar.length, data: similar });
+    } catch (error) {
+        next(error);
+    }
+});
+
 router.get('/:id', async (req, res, next) => {
     try {
         const perfume = await dataStore.getById(req.params.id);
