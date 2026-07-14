@@ -134,8 +134,9 @@ router.get('/perfumer/:name', async (req, res, next) => {
 router.get('/:id/similar', async (req, res, next) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 8, 24);
-        const minShared = Math.max(parseInt(req.query.minShared) || 2, 1);
-        const similar = await dataStore.getSimilarByNotes(req.params.id, { limit, minShared });
+        const minSharedNotes = Math.max(parseInt(req.query.minSharedNotes) || 2, 1);
+        const minSharedAccords = Math.max(parseInt(req.query.minSharedAccords) || 3, 1);
+        const similar = await dataStore.getSimilarByNotes(req.params.id, { limit, minSharedNotes, minSharedAccords });
         res.json({ success: true, count: similar.length, data: similar });
     } catch (error) {
         next(error);

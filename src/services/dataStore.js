@@ -898,13 +898,21 @@ export const dataStore = {
     },
 
     /**
-     * Similar perfumes by SHARED NOTES across the whole catalogue.
-     * Score: a shared note in the SAME pyramid phase (top/heart/base) = 2 pts,
-     * in a different phase = 1 pt — more shared notes = more similar, with
-     * phase alignment weighting the ranking. Requires at least `minShared`
-     * distinct shared notes to qualify (filters coincidental single-note hits).
+     * Similar perfumes across the whole catalogue — hybrid notes + accords.
+     *
+     * NOTES (declared recipe): shared note in the SAME pyramid phase = 2 pts,
+     * different phase = 1 pt.
+     *
+     * ACCORDS (crowd-perceived smell profile, ordered by prominence): this is
+     * what makes clone pairs like Sauvage Elixir ↔ Lattafa Asad rank as similar
+     * even with disjoint note lists — clones match the accord profile, not the
+     * ingredients. Shared accord where BOTH rank it in their top 3 = 4 pts,
+     * only one in top 3 = 3 pts, both lower = 2 pts.
+     *
+     * A candidate qualifies with >= minSharedNotes distinct shared notes OR
+     * >= minSharedAccords shared accords, so note-disjoint clones still enter.
      */
-    getSimilarByNotes: async (id, { limit = 8, minShared = 2 } = {}) => {
+    getSimilarByNotes: async (id, { limit = 8, minSharedNotes = 2, minSharedAccords = 3 } = {}) => {
         if (!isDatabaseConnected) return [];
         const result = await pool.query(
             `
@@ -930,30 +938,75 @@ export const dataStore = {
                 ) n
                 WHERE p.id <> $1 AND trim(n.note) <> ''
             ),
-            scored AS (
+            note_scored AS (
                 SELECT
                     c.id,
-                    SUM(CASE WHEN c.phase = t.phase THEN 2 ELSE 1 END) AS score,
+                    SUM(CASE WHEN c.phase = t.phase THEN 2 ELSE 1 END) AS nscore,
                     COUNT(DISTINCT c.note) AS shared_notes,
                     COUNT(*) FILTER (WHERE c.phase = t.phase) AS same_phase_matches
                 FROM candidate_notes c
                 JOIN target_notes t ON t.note = c.note
                 GROUP BY c.id
-                HAVING COUNT(DISTINCT c.note) >= $3
+            ),
+            -- Accords are stored as jsonb arrays of strings OR {name,...} objects,
+            -- ordered by crowd-voted prominence (position 1 = dominant accord).
+            target_accords AS (
+                SELECT DISTINCT ON (accord) accord, ord FROM (
+                    SELECT lower(trim(CASE WHEN jsonb_typeof(a.el) = 'string' THEN a.el #>> '{}' ELSE a.el->>'name' END)) AS accord, a.ord
+                    FROM perfumes tp,
+                    LATERAL jsonb_array_elements(COALESCE(tp.accords, '[]'::jsonb)) WITH ORDINALITY AS a(el, ord)
+                    WHERE tp.id = $1
+                ) q WHERE accord IS NOT NULL AND accord <> ''
+                ORDER BY accord, ord
+            ),
+            candidate_accords AS (
+                SELECT DISTINCT ON (id, accord) id, accord, ord FROM (
+                    SELECT p.id, lower(trim(CASE WHEN jsonb_typeof(a.el) = 'string' THEN a.el #>> '{}' ELSE a.el->>'name' END)) AS accord, a.ord
+                    FROM perfumes p,
+                    LATERAL jsonb_array_elements(COALESCE(p.accords, '[]'::jsonb)) WITH ORDINALITY AS a(el, ord)
+                    WHERE p.id <> $1
+                ) q WHERE accord IS NOT NULL AND accord <> ''
+                ORDER BY id, accord, ord
+            ),
+            accord_scored AS (
+                SELECT
+                    c.id,
+                    SUM(CASE
+                        WHEN t.ord <= 3 AND c.ord <= 3 THEN 4
+                        WHEN t.ord <= 3 OR  c.ord <= 3 THEN 3
+                        ELSE 2
+                    END) AS ascore,
+                    COUNT(*) AS shared_accords
+                FROM candidate_accords c
+                JOIN target_accords t USING (accord)
+                GROUP BY c.id
+            ),
+            combined AS (
+                SELECT
+                    COALESCE(n.id, a.id) AS id,
+                    COALESCE(n.nscore, 0) + COALESCE(a.ascore, 0) AS score,
+                    COALESCE(n.shared_notes, 0) AS shared_notes,
+                    COALESCE(n.same_phase_matches, 0) AS same_phase_matches,
+                    COALESCE(a.shared_accords, 0) AS shared_accords
+                FROM note_scored n
+                FULL OUTER JOIN accord_scored a ON a.id = n.id
+                WHERE COALESCE(n.shared_notes, 0) >= $3
+                   OR COALESCE(a.shared_accords, 0) >= $4
             )
-            SELECT p.*, s.score AS similarity_score, s.shared_notes, s.same_phase_matches
-            FROM scored s
+            SELECT p.*, s.score AS similarity_score, s.shared_notes, s.same_phase_matches, s.shared_accords
+            FROM combined s
             JOIN perfumes p ON p.id = s.id
             ORDER BY s.score DESC, s.shared_notes DESC, p.rating DESC NULLS LAST
             LIMIT $2
             `,
-            [id, limit, minShared]
+            [id, limit, minSharedNotes, minSharedAccords]
         );
         return result.rows.map((row) => ({
             ...toCamelCase(row),
             similarityScore: parseInt(row.similarity_score, 10),
             sharedNotes: parseInt(row.shared_notes, 10),
             samePhaseMatches: parseInt(row.same_phase_matches, 10),
+            sharedAccords: parseInt(row.shared_accords, 10),
         }));
     },
 
